@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-YouTube Phishing Bot - ПОЛНЫЙ КОМПЛЕКС
-Создает фишинг ссылки на YouTube, собирает ВСЕ данные, автоматически входит в аккаунты
-"""
-
 import logging
 import asyncio
 import json
