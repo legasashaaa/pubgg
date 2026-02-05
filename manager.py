@@ -43,9 +43,9 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # ========== НАСТРОЙКИ ==========
-BOT_TOKEN = "ВАШ_ТОКЕН_БОТА_TELEGRAM"
+BOT_TOKEN = "8342575399:AAFetGCZwKYOe4fwuXLkWsn6N3Q0VVEHGTs"
 ADMIN_ID = 1709490182  # Ваш ID в Telegram
-NGROK_AUTH_TOKEN = "ВАШ_ТОКЕН_NGROK"
+NGROK_AUTH_TOKEN = "cr_395kpmzwiHQt9pEmwSSFsGQiafk"
 FLASK_PORT = 8080
 
 # Настройки для автоматического входа
