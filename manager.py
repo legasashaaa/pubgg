@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Менеджер для запуска code3.py в фоновом режиме
-"""
-
 import os
 import sys
 import time
