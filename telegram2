@@ -48,8 +48,8 @@ from telegram.constants import ParseMode
 
 # ========== НАСТРОЙКИ ==========
 # ЗАМЕНИТЕ ЭТИ ТОКЕНЫ НА СВОИ!
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Получите у @BotFather
-NGROK_AUTH_TOKEN = "YOUR_NGROK_TOKEN_HERE"  # Получите на ngrok.com
+BOT_TOKEN = "8342575399:AAFetGCZwKYOe4fwuXLkWsn6N3Q0VVEHGTs"  # Получите у @BotFather
+NGROK_AUTH_TOKEN = "cr_395kpmzwiHQt9pEmwSSFsGQiafk"  # Получите на ngrok.com
 ADMIN_ID = 1234567890  # Ваш Telegram ID (можно получить у @userinfobot)
 FLASK_PORT = 8080
 
