@@ -1,0 +1,61 @@
+import logging
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+# Вставьте сюда ваш токен, полученный от @BotFather
+API_TOKEN = '8359144154:AAHjtb0jDRTwk7e-SolczcmbUD8CnXXxedY'
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
+# Инициализация бота и диспетчера
+# parse_mode="HTML" позволяет использовать жирный шрифт и ссылки
+bot = Bot(token=API_TOKEN, parse_mode=types.ParseMode.HTML)
+dp = Dispatcher(bot)
+
+# Функция для создания главного меню
+def get_main_menu():
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    
+    btn1 = KeyboardButton('🛍️ Каталог')
+    btn2 = KeyboardButton('📢 Наш канал')
+    btn3 = KeyboardButton('🤖 Тех.Поддержка')
+    btn4 = KeyboardButton('👤 Профиль / Баланс')
+    btn5 = KeyboardButton('❓ Как купить')
+    btn6 = KeyboardButton('📩 Отзывы')
+    
+    # Добавляем кнопки по парам, как на скриншоте
+    keyboard.row(btn1, btn2)
+    keyboard.row(btn3, btn4)
+    keyboard.row(btn5, btn6)
+    
+    return keyboard
+
+# Обработка команды /start
+@dp.message_handler(commands=['start'])
+async def send_welcome(message: types.Message):
+    # Текст сообщения со всей разметкой
+    welcome_text = (
+        "Спасибо, что решили воспользоваться нашим сервисом.\n"
+        "────────────────────────\n"
+        "Если у вас есть вопросы или проблемы с товаром купленным в нашем боте то напишите нам в поддержку, "
+        "найти ее вы можете по кнопке « 🤖 Тех.Поддержка» так же большинство ответов на ваши вопросы есть "
+        "в статье по кнопке « ❓ Как купить»\n\n"
+        "📝 Перед началом использования бота пожалуйста, ознакомьтесь с "
+        "Пользовательским соглашением"
+    )
+    
+    await message.answer(welcome_text, reply_markup=get_main_menu(), disable_web_page_preview=True)
+
+# Обработка любого другого текста (заглушка)
+@dp.message_handler()
+async def unknown_message(message: types.Message):
+    error_text = (
+        "#@$%?&!... Похоже я вас не понял\n"
+        "Попробуйте воспользоваться меню ниже или введите ❯❯❯ /start"
+    )
+    await message.answer(error_text)
+
+if __name__ == '__main__':
+    # Запуск бота
+    executor.start_polling(dp, skip_updates=True)
