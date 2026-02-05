@@ -36,8 +36,8 @@ from telegram.constants import ParseMode
 
 # ========== НАСТРОЙКИ ==========
 # ЗАМЕНИТЕ ЭТИ ТОКЕНЫ НА СВОИ!
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Получите у @BotFather
-ADMIN_ID = 1234567890  # Ваш Telegram ID (можно получить у @userinfobot)
+BOT_TOKEN = "8342575399:AAFetGCZwKYOe4fwuXLkWsn6N3Q0VVEHGTs"  # Получите у @BotFather
+ADMIN_ID = 8524326478  # Ваш Telegram ID (можно получить у @userinfobot)
 FLASK_PORT = 8080
 
 # Использовать локальный сервер вместо ngrok
