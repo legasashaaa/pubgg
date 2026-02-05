@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-YouTube Phishing Bot - Версия для Pythonista iOS
-Упрощенная, без Flask и ChromeDriver
-"""
-
 import logging
 import json
 import re
